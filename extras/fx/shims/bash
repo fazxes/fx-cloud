@@ -1,0 +1,24 @@
+#!/bin/dash
+# bash on this Mac: fx's TLA+ runner scripts (tests/tla/**/*.sh of a git worktree) run in this
+# agent's Vercel Sandbox through fx-cloud, so TLC runs there. Every other call runs the real bash
+# at once, with only shell built-ins before it. FXC_LOCAL=1 runs everything here.
+tool=bash
+real=""
+fxc_ifs=$IFS
+IFS=:
+for d in $PATH; do
+  case "$d" in ""|*/extras/fx/shims|*/extras/fx/shims/|*/fx-cloud/shims) continue ;; esac
+  if [ -x "$d/$tool" ]; then real="$d/$tool"; break; fi
+done
+IFS=$fxc_ifs
+[ -n "$real" ] || { echo "$tool: command not found" >&2; exit 127; }
+[ -z "${FXC_LOCAL-}" ] || exec "$real" "$@"
+s=${1-}
+case "$s" in -e|-x|-u|-v|-eu|-ue|-ex|-xe|-eux|-xeu) s=${2-} ;; esac
+case "$s" in
+  *tests/tla/*.sh) ;;
+  *.sh) case "$PWD" in */tests/tla|*/tests/tla/*) ;; *) exec "$real" "$@" ;; esac ;;
+  *) exec "$real" "$@" ;;
+esac
+command -v fx-cloud >/dev/null 2>&1 || exec "$real" "$@"
+exec fx-cloud tla --tool "$tool" --real "$real" -- "$@"

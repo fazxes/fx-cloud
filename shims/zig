@@ -1,0 +1,18 @@
+#!/bin/bash
+# zig on this Mac: `zig build` and `zig test` run in this agent's Vercel Sandbox through fx-cloud,
+# and every other command runs the real zig here. FXC_LOCAL=1 runs everything here.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+real=""
+IFS=: read -r -a dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+  [ -n "$d" ] && [ -x "$d/zig" ] || continue
+  [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$here" ] || continue
+  grep -qs 'exec fx-cloud ' "$d/zig" && continue  # another fx-cloud shim
+  real="$d/zig"
+  break
+done
+[ -n "$real" ] || { echo "zig: command not found" >&2; exit 127; }
+if [ -n "${FXC_LOCAL:-}" ] || ! command -v fx-cloud >/dev/null 2>&1; then
+  exec "$real" "$@"
+fi
+exec fx-cloud zig --real "$real" -- "$@"

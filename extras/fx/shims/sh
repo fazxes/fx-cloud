@@ -1,0 +1,18 @@
+#!/bin/dash
+# sh on this Mac: fx's TLA+ runner scripts (tests/tla/**/*.sh of a git worktree) run in this agent's
+# Vercel Sandbox through fx-cloud, so TLC runs there. Every other call runs the real sh at once,
+# with only shell built-ins before it. dash runs this, because it starts in a few ms.
+# FXC_LOCAL=1 runs everything here.
+tool='sh'
+# The real sh of macOS is always /bin/sh, near the end of PATH, so no PATH search.
+real=/bin/sh
+[ -z "${FXC_LOCAL-}" ] || exec "$real" "$@"
+s=${1-}
+case "$s" in -e|-x|-u|-v|-eu|-ue|-ex|-xe|-eux|-xeu) s=${2-} ;; esac
+case "$s" in
+  *tests/tla/*.sh) ;;
+  *.sh) case "$PWD" in */tests/tla|*/tests/tla/*) ;; *) exec "$real" "$@" ;; esac ;;
+  *) exec "$real" "$@" ;;
+esac
+command -v fx-cloud >/dev/null 2>&1 || exec "$real" "$@"
+exec fx-cloud tla --tool "$tool" --real "$real" -- "$@"

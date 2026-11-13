@@ -1,0 +1,18 @@
+#!/bin/bash
+# bun on this Mac: `bun test` and Bun drivers under tests/ run in this agent's Vercel Sandbox
+# through fx-cloud, and every other command runs the real bun here. FXC_LOCAL=1 runs everything here.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+real=""
+IFS=: read -r -a dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+  [ -n "$d" ] && [ -x "$d/bun" ] || continue
+  [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$here" ] || continue
+  grep -qs 'exec fx-cloud ' "$d/bun" && continue  # another fx-cloud shim
+  real="$d/bun"
+  break
+done
+[ -n "$real" ] || { echo "bun: command not found" >&2; exit 127; }
+if [ -n "${FXC_LOCAL:-}" ] || ! command -v fx-cloud >/dev/null 2>&1; then
+  exec "$real" "$@"
+fi
+exec fx-cloud bun --real "$real" -- "$@"
