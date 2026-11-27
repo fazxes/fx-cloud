@@ -11,6 +11,7 @@ Worktree copies (every op starts with the protocol version):
   patch V TOP                   binary patch of the copy's changes since the last apply, on stdout
   changes V TOP                 the changed paths since the last apply
   tar V DIR PATH                tarball of PATH (relative to DIR) for the Mac to download
+  packlogs V DIR OUT            the log files under DIR (*.log, *.out, *report.json; not in *.states or *.tmp folders; size-limited) as a tarball at OUT, plus a list of the ones left out
   runplain V ROOT CWD DIGEST PIDFILE SCRIPT
   applyplain V ROOT DIGEST BASE TAR DELETES
                                 the same for a folder that is not a git worktree: a one-way copy
@@ -23,6 +24,7 @@ Results for the Mac go to stderr as one line: FXC::<json>.
 """
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -51,6 +53,14 @@ TLC_CLEAN_KEEP = ["states/[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*/", "*_TTrace_[0-9]*
 # Warm .zig-cache folders that base.sh made from the `warm` builds, one per repository:
 # <name>/cache and <name>/meta.json with the build.zig.zon fingerprint and the commit.
 ZIG_SEEDS = os.path.expanduser("~/.cache/fxc-zig-seed")
+# These pick the log files that `fx-cloud tla` copies back to the Mac. TLC state folders (*.states)
+# and Java temp folders (*.tmp) can be huge, so they stay in the sandbox. The drivers' report.json
+# comes back too; their other JSON files are large state graphs.
+LOG_SUFFIXES = (".log", ".out", "report.json")
+SKIPPED_DIR_SUFFIXES = (".states", ".tmp")
+LOG_FILE_LIMIT_BYTES = 20 * 1024 * 1024
+LOG_TOTAL_LIMIT_BYTES = 50 * 1024 * 1024
+SKIPPED_MANIFEST = ".fxc-skipped"
 
 
 def emit(obj):
@@ -430,6 +440,59 @@ def op_tar(base_dir, path):
     return 0
 
 
+def op_packlogs(log_dir, out):
+    picked, skipped = pick_logs(log_entries(log_dir), LOG_FILE_LIMIT_BYTES, LOG_TOTAL_LIMIT_BYTES)
+    with tarfile.open(out, "w:gz") as tar:
+        for relpath in picked:
+            tar.add(os.path.join(log_dir, relpath), arcname=relpath, recursive=False)
+        if skipped:
+            add_skipped_manifest(tar, skipped)
+    emit({"packed": len(picked), "skipped": len(skipped), "tarball": out})
+    return 0
+
+
+def pick_logs(entries, file_limit_bytes, total_limit_bytes):
+    picked = []
+    skipped = []
+    total_bytes = 0
+    for relpath, size in sorted(entries):
+        if not is_log_path(relpath):
+            continue
+        if size > file_limit_bytes or total_bytes + size > total_limit_bytes:
+            skipped.append((relpath, size))
+            continue
+        picked.append(relpath)
+        total_bytes += size
+    return picked, skipped
+
+
+def is_log_path(relpath):
+    *folders, name = relpath.split("/")
+    if any(folder.endswith(SKIPPED_DIR_SUFFIXES) for folder in folders):
+        return False
+    return name.endswith(LOG_SUFFIXES)
+
+
+def log_entries(log_dir):
+    entries = []
+    for root, dirs, files in os.walk(log_dir, followlinks=False):
+        dirs[:] = [d for d in dirs if not d.endswith(SKIPPED_DIR_SUFFIXES)]
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            relpath = os.path.relpath(path, log_dir).replace(os.sep, "/")
+            entries.append((relpath, os.path.getsize(path)))
+    return entries
+
+
+def add_skipped_manifest(tar, skipped):
+    data = "".join("%s\t%d\n" % (relpath, size) for relpath, size in skipped).encode()
+    info = tarfile.TarInfo(SKIPPED_MANIFEST)
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
+
+
 # --------------------------------------------------------------------------- plain folder copies
 
 PLAIN_STATE = os.path.expanduser("~/.cache/fx-cloud/plain")
@@ -505,7 +568,7 @@ def main(argv):
         print(repo_for(https_url(rest[0])))
         return 0
     ops = {"run": (op_run, 8), "apply": (op_apply, 9), "patch": (op_patch, 1),
-           "changes": (op_changes, 1), "tar": (op_tar, 2),
+           "changes": (op_changes, 1), "tar": (op_tar, 2), "packlogs": (op_packlogs, 2),
            "runplain": (op_runplain, 5), "applyplain": (op_applyplain, 5)}
     if op not in ops or not rest or rest[0] != PROTOCOL:
         # A newer Mac script may send an op that this helper lacks; both cases need the new helper.

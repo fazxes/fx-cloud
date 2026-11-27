@@ -117,6 +117,8 @@ Zig compiles `build.zig` into native programs, and sandboxes land on a few diffe
 - `"setup_hook": "<this folder>/extras/fx/setup.sh"` adds Java 21 with `tla2tools.jar` for the TLA+ model checks, zsh and fish for the shell tests, and CI's tmux defaults to the base.
 - `export PATH="<this folder>/extras/fx/shims:$PATH"` sends `sh`, `bash`, and `python3` calls of TLA+ runners under `tests/tla/` (such as `sh tests/tla/<spec>/check.sh`) to the sandbox, through `fx-cloud tla`.
 
+Each TLA+ run gets its own `TMPDIR` in the sandbox, `/tmp/fxc-tla-<uid>/<id>`. When the run ends, its log files (`*.log`, `*.out`, and the drivers' `report.json`, up to 20 MB each and 50 MB in all) come back to the same path on the Mac, so the `logs:` and `(see …)` paths that TLC prints work there. The `*.states` and `*.tmp` folders stay in the sandbox. A log that is too large stays there too, and fx-cloud prints the `fx-cloud pull` command for it. The copy never changes the exit code of the run.
+
 ## How it works
 
 - **One sandbox for each agent and folder.** The owner of a command is the nearest fx, Claude Code, or Codex process above it (its process ID and start time), or `FXC_OWNER`, or else the shell. The folder is the git worktree around the current folder. The sandbox is named `<prefix><12 hex digits>`, starts from the base snapshot, and keeps nothing when it ends.

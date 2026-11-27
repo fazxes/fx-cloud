@@ -9,10 +9,13 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -454,6 +457,248 @@ class HelperTests(Case):
         self.assertEqual(clean["sha"], changed["sha"])
         self.assertNotEqual(clean["tree"], changed["tree"])
         self.assertEqual(fxc.copy_info(dict(changed))["cwip"], fxc.copy_info(dict(fxc.local_state(repo)))["cwip"])
+
+
+class TlaLogTests(unittest.TestCase):
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="fxc-tla-unit-")
+        self.addCleanup(folder.cleanup)
+        self.tmp = folder.name
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("FXC_SHIM_DRYRUN", None)
+
+    def path(self, *parts):
+        return os.path.join(self.tmp, *parts)
+
+    def write_text(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    def add_file(self, tar, name, data):
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    def test_run_dir_is_per_user_and_per_run(self):
+        self.assertEqual(tla.run_dir_path(501, "ab12cd34"), "/tmp/fxc-tla-501/ab12cd34")
+
+    def test_remote_script_gives_the_command_its_own_tmpdir_and_keeps_its_exit_code(self):
+        run_dir, seen, packed = self.path("run"), self.path("seen"), self.path("packed")
+        command = "sh -c " + shlex.quote('printf hi > "$TMPDIR/a.log"; printf %s "$TMPDIR" > '
+                                         + shlex.quote(seen) + "; exit 7")
+        pack_command = 'cat "$TMPDIR/a.log" > ' + shlex.quote(packed)
+        script = tla.remote_script(command, run_dir, pack_command)
+        result = subprocess.run(["bash", "-c", script], capture_output=True)
+        self.assertEqual(result.returncode, 7)
+        with open(seen) as f:
+            self.assertEqual(f.read(), run_dir)
+        with open(packed) as f:
+            self.assertEqual(f.read(), "hi")
+        self.assertTrue(os.path.isfile(os.path.join(run_dir, "a.log")))
+
+    def test_pick_logs_keeps_small_logs_and_reports_big_ones(self):
+        entries = [("b/x.log", 5), ("a/y.out", 3), ("a/z.txt", 1),
+                   ("a/M.states/s.log", 1), ("a/M.tmp/t.log", 1), ("big.log", 50)]
+        picked, skipped = remote.pick_logs(entries, 10, 100)
+        self.assertEqual(picked, ["a/y.out", "b/x.log"])
+        self.assertEqual(skipped, [("big.log", 50)])
+
+    def test_pick_logs_stops_at_the_total_limit(self):
+        picked, skipped = remote.pick_logs([("a.log", 6), ("b.log", 6)], 10, 10)
+        self.assertEqual(picked, ["a.log"])
+        self.assertEqual(skipped, [("b.log", 6)])
+
+    def test_pick_logs_keeps_driver_reports_but_not_other_json(self):
+        picked, skipped = remote.pick_logs([("a/report.json", 10), ("a/binary-report.json", 5),
+                                            ("a/graph.json", 7)], 100, 100)
+        self.assertEqual(picked, ["a/binary-report.json", "a/report.json"])
+        self.assertEqual(skipped, [])
+
+    def test_packlogs_packs_only_log_files_and_lists_skipped_ones(self):
+        log_dir, out, outside = self.path("logs"), self.path("out.tgz"), self.path("outside.txt")
+        self.write_text(os.path.join(log_dir, "a", "x.log"), "abc")
+        self.write_text(os.path.join(log_dir, "a", "y.txt"), "no")
+        self.write_text(os.path.join(log_dir, "a", "S.states", "z.log"), "zz")
+        self.write_text(os.path.join(log_dir, "a", "T.tmp", "w.log"), "ww")
+        self.write_text(os.path.join(log_dir, "big.log"), "x" * 20)
+        self.write_text(outside, "secret")
+        os.symlink(outside, os.path.join(log_dir, "link.log"))
+        with mock.patch.object(remote, "LOG_FILE_LIMIT_BYTES", 10):
+            code = remote.op_packlogs(log_dir, out)
+        self.assertEqual(code, 0)
+        with tarfile.open(out, "r:gz") as tar:
+            names = sorted(tar.getnames())
+            manifest = tar.extractfile(".fxc-skipped").read().decode()
+        self.assertEqual(names, [".fxc-skipped", "a/x.log"])
+        self.assertEqual(manifest, "big.log\t20\n")
+
+    def test_packlogs_writes_an_empty_tarball_when_the_folder_is_missing(self):
+        out = self.path("out.tgz")
+        code = remote.op_packlogs(self.path("missing"), out)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(out))
+        with tarfile.open(out, "r:gz") as tar:
+            self.assertEqual(tar.getmembers(), [])
+
+    def test_log_entries_does_not_walk_into_state_folders(self):
+        log_dir = self.path("logs")
+        self.write_text(os.path.join(log_dir, "a", "x.log"), "abc")
+        self.write_text(os.path.join(log_dir, "a", "M.states", "deep", "s.log"), "state")
+        real_getsize = os.path.getsize
+        stated = []
+
+        def record_getsize(path):
+            stated.append(path)
+            return real_getsize(path)
+
+        with mock.patch.object(remote.os.path, "getsize", side_effect=record_getsize):
+            entries = remote.log_entries(log_dir)
+        self.assertEqual(entries, [("a/x.log", 3)])
+        self.assertFalse([path for path in stated if ".states" in path])
+
+    def test_dispatch_knows_packlogs(self):
+        log_dir, out = self.path("logs"), self.path("out.tgz")
+        os.makedirs(log_dir)
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = remote.main(["packlogs", remote.PROTOCOL, log_dir, out])
+            usage = remote.main(["packlogs", remote.PROTOCOL, log_dir])
+        self.assertEqual(ok, 0)
+        self.assertEqual(usage, 2)
+
+    def test_extract_logs_writes_only_files_inside_the_run_dir(self):
+        tgz, dest = self.path("logs.tgz"), self.path("run")
+        os.makedirs(dest)
+        with tarfile.open(tgz, "w:gz") as tar:
+            self.add_file(tar, "ok/x.log", b"hi")
+            self.add_file(tar, "../evil.log", b"evil")
+            link = tarfile.TarInfo("ok/link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc/passwd"
+            tar.addfile(link)
+            self.add_file(tar, ".fxc-skipped", b"big.log\t99\n")
+        result = tla.extract_logs(tgz, dest)
+        self.assertEqual(result, (1, ["big.log\t99"], None))
+        with open(os.path.join(dest, "ok", "x.log")) as f:
+            self.assertEqual(f.read(), "hi")
+        self.assertEqual(os.stat(os.path.join(dest, "ok", "x.log")).st_mode & 0o777, 0o600)
+        self.assertFalse(os.path.exists(self.path("evil.log")))
+        self.assertFalse(os.path.lexists(os.path.join(dest, "ok", "link")))
+        self.assertFalse(os.path.exists(os.path.join(dest, ".fxc-skipped")))
+
+    def test_extract_logs_reports_a_broken_tarball(self):
+        tgz = self.path("broken.tgz")
+        with open(tgz, "wb") as f:
+            f.write(b"this is not a tarball")
+        count, skipped, error = tla.extract_logs(tgz, self.path("run"))
+        self.assertEqual(count, 0)
+        self.assertEqual(skipped, [])
+        self.assertIsInstance(error, str)
+        self.assertTrue(error)
+
+    def test_logs_parent_must_be_a_private_folder_of_this_user(self):
+        logs, link = self.path("logs"), self.path("link")
+        self.assertTrue(tla.prepare_logs_parent(logs, os.getuid()))
+        self.assertEqual(os.stat(logs).st_mode & 0o777, 0o700)
+        os.symlink(logs, link)
+        self.assertFalse(tla.prepare_logs_parent(link, os.getuid()))
+
+    def test_logs_parent_of_another_user_is_refused(self):
+        self.assertFalse(tla.prepare_logs_parent(self.path("logs"), os.getuid() + 1))
+
+    def test_skipped_manifest_names_match(self):
+        self.assertEqual(tla.SKIPPED_MANIFEST, remote.SKIPPED_MANIFEST)
+
+    def test_main_runs_the_wrapped_command_and_brings_logs_back(self):
+        repo = self.path("proj")
+        self.write_text(os.path.join(repo, "tests", "tla", "demo", "check.sh"), "exit 0\n")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(repo)
+        scripts = []
+
+        def run_here(script, flags, capture=False):
+            scripts.append(script)
+            return 3, b""
+
+        core = types.SimpleNamespace(
+            take_flags=fxc.take_flags,
+            die=fxc.die,
+            subprocess=subprocess,
+            project_allows_remote=lambda path: True,
+            need_config=lambda tool: None,
+            say=lambda msg: None,
+            helper_script=lambda op, *a: "PACK " + op + " " + " ".join(a),
+            run_here=run_here,
+        )
+        with mock.patch.object(tla, "bring_logs_back") as bring_back:
+            code = tla.main(core, ["--tool", "sh", "--real", "/bin/sh", "--", "tests/tla/demo/check.sh"])
+        self.assertEqual(code, 3)
+        self.assertEqual(len(scripts), 1)
+        self.assertIn("TMPDIR", scripts[0])
+        self.assertIn("check.sh", scripts[0])
+        self.assertIn("PACK packlogs", scripts[0])
+        bring_back.assert_called_once()
+        core_arg, run_dir, uid = bring_back.call_args.args
+        self.assertIs(core_arg, core)
+        self.assertEqual(uid, os.getuid())
+        self.assertRegex(run_dir, "^/tmp/fxc-tla-%d/[0-9a-f]{8}$" % os.getuid())
+
+    def copy_download(self, source, argv):
+        with open(source, "rb") as f, open(argv[-1], "wb") as out:
+            out.write(f.read())
+        return 0
+
+    def leftover_downloads(self):
+        root = self.path("logs-root")
+        return [name for name in os.listdir(root) if name.startswith("logs-") and name.endswith(".tgz")]
+
+    def bring_back(self, call, run_dir):
+        said = []
+        core = types.SimpleNamespace(
+            SANDBOX="fxa-test",
+            say=said.append,
+            vercel=lambda sub, *args: [sub] + list(args),
+            subprocess=types.SimpleNamespace(call=call, DEVNULL=subprocess.DEVNULL),
+        )
+        tla.bring_logs_back(core, run_dir, os.getuid())
+        return said
+
+    def test_bring_logs_back_unpacks_the_download_and_says_what_it_copied(self):
+        run_dir = self.path("logs-root", "ab12cd34")
+        source = self.path("source.tgz")
+        with tarfile.open(source, "w:gz") as tar:
+            self.add_file(tar, "fx-tla-demo.X/Demo.log", b"model error")
+            self.add_file(tar, ".fxc-skipped", b"fx-tla-demo.X/Big.log\t31457280\n")
+        call = mock.Mock(side_effect=lambda argv, **kw: self.copy_download(source, argv))
+        said = self.bring_back(call, run_dir)
+        with open(os.path.join(run_dir, "fx-tla-demo.X", "Demo.log")) as f:
+            self.assertEqual(f.read(), "model error")
+        call.assert_called_once()
+        self.assertEqual(call.call_args.args[0][1], "fxa-test:" + run_dir + ".tgz")
+        self.assertEqual(said, [
+            "copied 1 TLC log file to " + run_dir,
+            run_dir + "/fx-tla-demo.X/Big.log is too large to copy (30 MB); get it with: fx-cloud pull "
+            + run_dir + "/fx-tla-demo.X/Big.log <dest>",
+        ])
+        self.assertEqual(self.leftover_downloads(), [])
+
+    def test_bring_logs_back_says_so_when_the_download_fails(self):
+        run_dir = self.path("logs-root", "ab12cd34")
+        said = self.bring_back(mock.Mock(return_value=1), run_dir)
+        self.assertEqual(said, ["could not copy the TLC logs back from the sandbox (" + run_dir + ".tgz)"])
+        self.assertEqual(self.leftover_downloads(), [])
+
+    def test_bring_logs_back_keeps_going_when_the_download_file_cannot_be_made(self):
+        run_dir = self.path("logs-root", "ab12cd34")
+        call = mock.Mock(return_value=0)
+        with mock.patch.object(tla.tempfile, "mkstemp", side_effect=OSError("disk full")):
+            said = self.bring_back(call, run_dir)
+        call.assert_not_called()
+        self.assertEqual(said, ["could not copy the TLC logs back: disk full"])
 
 
 if __name__ == "__main__":
