@@ -201,6 +201,33 @@ agent=$(python3 -c 'import os, sys; print([n[:-5] for n in sorted(os.listdir(sys
 check "ls lists the agent sandbox" contains "$T/ls.out" "$agent"
 "$FXC" status >"$T/status.out" 2>&1 || true
 check "status shows the base snapshot" contains "$T/status.out" "base snapshot: snap_"
+
+# A stand-in TLA+ runner (no Java) fails and prints its log path; the log copies back to the Mac.
+mkdir -p "$R/tests/tla/demo"
+cat >"$R/tests/tla/demo/check.sh" <<'EOF'
+#!/bin/sh
+d="$(mktemp -d "${TMPDIR:-/tmp}/fx-tla-demo.XXXXXX")"
+echo "logs: $d"
+echo "model error in Demo" > "$d/Demo.log"
+mkdir -p "$d/Demo.states" && echo state > "$d/Demo.states/s.log"
+echo "FAIL  Demo: expected -, TLC exited 12 (see $d/Demo.log)"
+exit 1
+EOF
+rc=0
+"$FXC" tla --tool sh --real /bin/sh -- tests/tla/demo/check.sh >"$T/tla.out" 2>"$T/tla.err" || rc=$?
+tla_log=$(sed -n 's/.*(see \(.*\))$/\1/p' "$T/tla.out")
+tla_run=$(dirname "$(dirname "$tla_log")")
+check "tla exits with the script's exit code (1)" test "$rc" = 1
+check "tla prints the sandbox log folder" contains "$T/tla.out" "logs: /tmp/fxc-tla-$(id -u)/"
+check "the log from the (see ...) line exists on the Mac" test -f "$tla_log"
+check "that log holds the model error" contains "$tla_log" "model error in Demo"
+check "the Demo.states folder stays in the sandbox" test -n "$tla_log" -a ! -e "$(dirname "$tla_log")/Demo.states"
+check "tla reports the copy on stderr" contains "$T/tla.err" "copied 1 TLC log file to"
+case "$tla_run" in
+  /tmp/fxc-tla-"$(id -u)"/????????) rm -rf -- "$tla_run" ;;
+  *) echo "  not removing $tla_run: not a TLA+ run folder" ;;
+esac
+
 check "done removes the sandbox" "$FXC" "done"
 gone=0
 for _ in 1 2 3 4 5 6; do

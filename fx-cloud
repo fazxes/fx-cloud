@@ -1710,11 +1710,12 @@ def run_plain(script, capture):
         return rc, out
 
 
-def run_checked(st, script, capture=False, force=False):
+def run_checked_and_ran(st, script, capture=False, force=False):
     """Runs SCRIPT in the sandbox copy of the worktree. When the copy may differ from the Mac, the
-    same sandbox call first makes it match, so a changed worktree usually costs one call."""
+    same sandbox call first makes it match, so a changed worktree usually costs one call. Returns
+    (rc, out, ran); ran is False when the sandbox did not start SCRIPT."""
     if st is None:
-        return run_plain(script, capture)
+        return run_plain(script, capture) + (True,)
     strategies = None
     copy = force or not cache_says_synced(st)
     helper_updated = False
@@ -1750,7 +1751,7 @@ def run_checked(st, script, capture=False, force=False):
         if changed:
             forget_synced(st)
             report_sandbox_changed(changed["sandbox_changed"])
-            return 1, out
+            return 1, out, False
         err = next((r for r in results if r.get("error")), None)
         if err and err["error"] == "prerequisite" and strategies and len(strategies) > 1:
             strategies.pop(0)  # the sandbox lacks commits the bundle builds on; send more history
@@ -1758,7 +1759,7 @@ def run_checked(st, script, capture=False, force=False):
         if err:
             forget_synced(st)
             say("sandbox: %s %s" % (err["error"], err.get("detail", "")))
-            return 1, out
+            return 1, out, False
         if rc == NEEDS_PUSH and last.get("needs_push"):
             if copy:
                 die("the sandbox copy still differs after copying; run with --force")
@@ -1768,8 +1769,14 @@ def run_checked(st, script, capture=False, force=False):
         if applied and not applied.get("tree_match", True):
             say("note: the sandbox copy differs from the Mac in ignored or special files")
         remember_synced(st)
-        return rc, out
+        return rc, out, True
     die("the sandbox copy did not settle after several tries")
+
+
+def run_checked(st, script, capture=False, force=False):
+    """Runs SCRIPT like run_checked_and_ran, and returns only (rc, out)."""
+    rc, out, _ = run_checked_and_ran(st, script, capture=capture, force=force)
+    return rc, out
 
 
 def plain_state(path):
@@ -1939,6 +1946,17 @@ def run_here(script, flags, capture=False):
     ps = plain_state(os.getcwd())
     use_sandbox(ps["root"])
     return run_checked_plain(ps, script, capture=capture, force=force)
+
+
+def run_here_and_ran(script):
+    """Runs SCRIPT the way run_here(script, {}) does, and also says whether the sandbox started it.
+    A plain folder always counts as started."""
+    st = local_state(os.getcwd(), [])
+    if st is None:
+        rc, out = run_here(script, {})
+        return rc, out, True
+    use_sandbox(st["top"])
+    return run_checked_and_ran(st, script)
 
 
 def cmd_run(args):
