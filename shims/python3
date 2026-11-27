@@ -1,0 +1,25 @@
+#!/bin/dash
+# python3 on this Mac: fx's TLA+ runner scripts (tests/tla/**/*.py of a git worktree, such as
+# tests/tla/mcp/run.py) run in this agent's Vercel Sandbox through fx-cloud, so TLC does not load
+# the Mac. Every other call runs the real python3 at once, by its absolute path, with only shell
+# built-ins before it. FXC_LOCAL=1 runs everything here.
+tool=python3
+real=""
+fxc_ifs=$IFS
+IFS=:
+for d in $PATH; do
+  case "$d" in ""|"$HOME/.local/share/fx-cloud/shims"|*/fx-cloud/shims) continue ;; esac
+  if [ -x "$d/$tool" ]; then real="$d/$tool"; break; fi
+done
+IFS=$fxc_ifs
+[ -n "$real" ] || { echo "$tool: command not found" >&2; exit 127; }
+[ -z "${FXC_LOCAL-}" ] || exec "$real" "$@"
+s=${1-}
+case "$s" in -u|-B|-E|-s|-S|-O) s=${2-} ;; esac
+case "$s" in
+  *tests/tla/*.py) ;;
+  *.py) case "$PWD" in */tests/tla|*/tests/tla/*) ;; *) exec "$real" "$@" ;; esac ;;
+  *) exec "$real" "$@" ;;
+esac
+command -v fx-cloud >/dev/null 2>&1 || exec "$real" "$@"
+exec fx-cloud tla --tool "$tool" --real "$real" -- "$@"

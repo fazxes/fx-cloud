@@ -11,18 +11,19 @@ Worktree copies (every op starts with the protocol version):
   patch V TOP                   binary patch of the copy's changes since the last apply, on stdout
   changes V TOP                 the changed paths since the last apply
   tar V DIR PATH                tarball of PATH (relative to DIR) for the Mac to download
+  packlogs V DIR OUT            the log files under DIR (*.log, *.out, *report.json; not in *.states or *.tmp folders; size-limited) as a tarball at OUT, plus a list of the ones left out
   runplain V ROOT CWD DIGEST PIDFILE SCRIPT
   applyplain V ROOT DIGEST BASE TAR DELETES
                                 the same for a folder that is not a git worktree: a one-way copy
 
-For base.sh (no protocol version):
-  repo URL                      make the repository that holds the objects of URL's copies, and
-                                print its path
-
-Results for the Mac go to stderr as one line: FXC::<json>.
+Results for the Mac go to stderr as one line: FXC::<json>. While a command runs, a FXC::tick line
+goes to stderr every TICK_S seconds, because `vercel sandbox exec` drops a stream that is quiet for
+about 12 minutes; the command's exit code follows it as FXC::{"exit": N}, so the Mac can tell a
+finished command from a lost stream.
 """
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -31,6 +32,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 
 with open(os.path.abspath(__file__), "rb") as _self:
@@ -38,9 +40,10 @@ with open(os.path.abspath(__file__), "rb") as _self:
     PROTOCOL = hashlib.sha256(_self.read()).hexdigest()[:12]
 NEEDS_PUSH = 75
 OLD_HELPER = 76
-# One repository for each origin URL. It holds the objects of every copy of that project, and
-# base.sh clones the `warm` repositories here, so a copy needs only the commits after the base.
-REPOS = os.path.expanduser("~/.cache/fx-cloud/repos")
+TICK_S = 60  # well under the exec stream's idle cutoff of about 12 minutes
+TICK = "FXC::tick\n"  # the Mac script removes it, also when it ends a partial line of the command
+WS = os.environ.get("FXC_REMOTE_WS", "/Users/faxes/Developer/Fx")
+CACHE = os.path.expanduser("~/.cache/fx-cloud/repos")
 MARKER = "fx-cloud-pushed.json"
 # TLC's own working files: state folders named by date and time, and trace specs. They are not
 # part of the Mac's work, so neither side counts them, and `git clean` keeps them, so a running
@@ -48,9 +51,17 @@ MARKER = "fx-cloud-pushed.json"
 TLC_PATHSPECS = [":(exclude,glob)**/states/[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*/**",
                  ":(exclude,glob)**/*_TTrace_[0-9]*.tla", ":(exclude,glob)**/*_TTrace_[0-9]*.bin"]
 TLC_CLEAN_KEEP = ["states/[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*/", "*_TTrace_[0-9]*"]
-# Warm .zig-cache folders that base.sh made from the `warm` builds, one per repository:
+# Warm .zig-cache folders that base.sh made from origin/main builds, one per project:
 # <name>/cache and <name>/meta.json with the build.zig.zon fingerprint and the commit.
 ZIG_SEEDS = os.path.expanduser("~/.cache/fxc-zig-seed")
+# These pick the log files that `fx-cloud tla` copies back to the Mac. TLC state folders (*.states)
+# and Java temp folders (*.tmp) can be huge, so they stay in the sandbox. The drivers' report.json
+# comes back too; their other JSON files are large state graphs.
+LOG_SUFFIXES = (".log", ".out", "report.json")
+SKIPPED_DIR_SUFFIXES = (".states", ".tmp")
+LOG_FILE_LIMIT_BYTES = 20 * 1024 * 1024
+LOG_TOTAL_LIMIT_BYTES = 50 * 1024 * 1024
+SKIPPED_MANIFEST = ".fxc-skipped"
 
 
 def emit(obj):
@@ -96,7 +107,7 @@ def worktree_tree(top, includes=()):
     tmp = os.path.join(gitdir, "fx-cloud-index.%d" % os.getpid())
     try:
         if os.path.exists(index):
-            shutil.copy2(index, tmp)  # keeps its time, so git still re-reads racily clean files
+            shutil.copyfile(index, tmp)
         env = dict(os.environ, GIT_INDEX_FILE=tmp)
         git(top, "add", "-A", "--", ".", *TLC_PATHSPECS, env=env)
         present = [p for p in includes if os.path.lexists(os.path.join(top, p))]
@@ -157,22 +168,13 @@ def ref_key(top):
 
 
 def https_url(url):
-    """The URL the sandbox fetches from: SSH remotes become HTTPS, because the sandbox has no SSH
-    keys; `gh auth setup-git` signs HTTPS fetches in to GitHub."""
-    url = url.strip().rstrip("/")
-    m = re.match(r"^(?:ssh://)?git@([^:/]+)[:/](.+)$", url)
-    if m:
-        url = "https://%s/%s" % (m.group(1), m.group(2))
+    if url.startswith("git@github.com:"):
+        url = "https://github.com/" + url[len("git@github.com:"):]
+    elif url.startswith("ssh://git@github.com/"):
+        url = "https://github.com/" + url[len("ssh://git@github.com/"):]
     if url.startswith("https://github.com/") and not url.endswith(".git"):
         url += ".git"
     return url
-
-
-def repo_slug(url):
-    """The folder name of URL's repository: host and path, such as github.com__owner__name."""
-    rest = re.sub(r"^[a-z+]+://", "", url)
-    rest = re.sub(r"\.git$", "", rest)
-    return re.sub(r"[^A-Za-z0-9._-]+", "__", rest).strip("_") or "repo"
 
 
 def ensure_dir(path):
@@ -186,28 +188,27 @@ def ensure_dir(path):
         subprocess.run(["sudo", "chown", "%d:%d" % (os.getuid(), os.getgid()), path], check=True)
 
 
-def repo_for(url):
-    """The bare repository for origin URL, made when it does not exist yet."""
-    os.makedirs(REPOS, exist_ok=True)
-    path = os.path.join(REPOS, repo_slug(url) + ".git")
-    if not os.path.isdir(path):
-        subprocess.run(["git", "init", "-q", "--bare", path], check=True)
-        git(path, "remote", "add", "origin", url)
-        git(path, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
-    return path
-
-
 def ensure_base(top, origin):
     """The repository that holds the objects for the copy of TOP."""
     if is_worktree(top):
         return top
-    if origin:
-        return repo_for(https_url(origin))
-    os.makedirs(REPOS, exist_ok=True)
-    path = os.path.join(REPOS, "local-" + ref_key(top) + ".git")
-    if not os.path.isdir(path):
-        subprocess.run(["git", "init", "-q", "--bare", path], check=True)
-    return path
+    url = https_url(origin) if origin else ""
+    if url and os.path.isdir(WS):
+        for name in sorted(os.listdir(WS)):
+            cand = os.path.join(WS, name)
+            if os.path.isdir(os.path.join(cand, ".git")):
+                p = git(cand, "remote", "get-url", "origin", check=False)
+                if p.returncode == 0 and https_url(p.stdout.decode().strip()) == url:
+                    return cand
+    os.makedirs(CACHE, exist_ok=True)
+    slug = url.split("github.com/")[-1].replace("/", "__") if url else "local-" + ref_key(top)
+    base = os.path.join(CACHE, slug.replace(".git", "") + ".git")
+    if not os.path.isdir(base):
+        subprocess.run(["git", "init", "-q", "--bare", base], check=True)
+        if url:
+            git(base, "remote", "add", "origin", url)
+            git(base, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    return base
 
 
 def write_exclude(repo, path):
@@ -271,7 +272,7 @@ def seed_zig_cache(top):
             shutil.rmtree(tmp, ignore_errors=True)
             return
         sys.stderr.write("fx-cloud: .zig-cache starts from the warm cache of %s %s (copied in %.1f s)\n"
-                         % (meta.get("name", name), meta.get("commit", "?"), time.time() - start))
+                         % (name, meta.get("commit", "?"), time.time() - start))
         return
 
 
@@ -294,12 +295,25 @@ def spawn(run_dir, pidfile, script):
 
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, stop)
+    ended = threading.Event()
+
+    def tick():
+        while not ended.wait(TICK_S):
+            sys.stderr.write(TICK)
+            sys.stderr.flush()
+
+    ticker = threading.Thread(target=tick, daemon=True)
+    ticker.start()
     rc = child.wait()
+    ended.set()
+    ticker.join()
     try:
         os.unlink(pidfile)
     except OSError:
         pass
-    return rc if rc >= 0 else 128 - rc
+    rc = rc if rc >= 0 else 128 - rc
+    emit({"exit": rc})
+    return rc
 
 
 def op_run(top, cwd, sha, tree, cwip, includes, pidfile, script):
@@ -357,7 +371,7 @@ def apply_copy(top, sha, tree, cwip, inc, origin, bundle, exclude, force):
         p = git(base, "fetch", "-q", bundle, "+%s:%s" % (key, key), check=False)
         if p.returncode != 0 and origin:
             # The bundle builds on commits this repository lacks; get them from origin, then retry.
-            git(base, "fetch", "-q", "origin", env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), check=False)
+            git(base, "fetch", "-q", "origin", check=False)
             p = git(base, "fetch", "-q", bundle, "+%s:%s" % (key, key), check=False)
         if p.returncode != 0:
             err = p.stderr.decode(errors="replace")
@@ -428,6 +442,60 @@ def op_tar(base_dir, path):
         tar.add(full, arcname=os.path.basename(full.rstrip("/")))
     emit({"tarball": out, "bytes": os.path.getsize(out)})
     return 0
+
+
+def op_packlogs(log_dir, out):
+    picked, skipped = pick_logs(log_entries(log_dir), LOG_FILE_LIMIT_BYTES, LOG_TOTAL_LIMIT_BYTES)
+    with tarfile.open(out, "w:gz") as tar:
+        for relpath in picked:
+            tar.add(os.path.join(log_dir, relpath), arcname=relpath, recursive=False)
+        if skipped:
+            add_skipped_manifest(tar, skipped)
+    emit({"packed": len(picked), "skipped": len(skipped), "tarball": out})
+    return 0
+
+
+def pick_logs(entries, file_limit_bytes, total_limit_bytes):
+    picked = []
+    skipped = []
+    total_bytes = 0
+    for relpath, size in sorted(entries):
+        if not is_log_path(relpath):
+            continue
+        if size > file_limit_bytes or total_bytes + size > total_limit_bytes:
+            skipped.append((relpath, size))
+            continue
+        picked.append(relpath)
+        total_bytes += size
+    return picked, skipped
+
+
+def is_log_path(relpath):
+    *folders, name = relpath.split("/")
+    if any(folder.endswith(SKIPPED_DIR_SUFFIXES) for folder in folders):
+        return False
+    return name.endswith(LOG_SUFFIXES)
+
+
+def log_entries(log_dir):
+    entries = []
+    for root, dirs, files in os.walk(log_dir, followlinks=False):
+        dirs[:] = [d for d in dirs if not d.endswith(SKIPPED_DIR_SUFFIXES)]
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            relpath = os.path.relpath(path, log_dir).replace(os.sep, "/")
+            entries.append((relpath, os.path.getsize(path)))
+    return entries
+
+
+def add_skipped_manifest(tar, skipped):
+    entries = [{"path": relpath, "bytes": size} for relpath, size in skipped]
+    data = json.dumps(entries).encode("utf-8")
+    info = tarfile.TarInfo(SKIPPED_MANIFEST)
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
 
 
 # --------------------------------------------------------------------------- plain folder copies
@@ -501,14 +569,13 @@ def main(argv):
         print(__doc__, file=sys.stderr)
         return 2
     op, rest = argv[0], argv[1:]
-    if op == "repo" and len(rest) == 1:
-        print(repo_for(https_url(rest[0])))
-        return 0
     ops = {"run": (op_run, 8), "apply": (op_apply, 9), "patch": (op_patch, 1),
-           "changes": (op_changes, 1), "tar": (op_tar, 2),
+           "changes": (op_changes, 1), "tar": (op_tar, 2), "packlogs": (op_packlogs, 2),
            "runplain": (op_runplain, 5), "applyplain": (op_applyplain, 5)}
-    if op not in ops or not rest or rest[0] != PROTOCOL:
-        # A newer Mac script may send an op that this helper lacks; both cases need the new helper.
+    if op not in ops:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if not rest or rest[0] != PROTOCOL:
         emit({"error": "old_helper", "have": PROTOCOL})
         return OLD_HELPER
     fn, nargs = ops[op]

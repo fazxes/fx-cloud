@@ -5,11 +5,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 real=""
 IFS=: read -r -a dirs <<< "$PATH"
 for d in "${dirs[@]}"; do
-  [ -n "$d" ] && [ -x "$d/bun" ] || continue
-  [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$here" ] || continue
-  grep -qs 'exec fx-cloud ' "$d/bun" && continue  # another fx-cloud shim
-  real="$d/bun"
-  break
+  [ -n "$d" ] && [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$here" ] && [ -x "$d/bun" ] && { real="$d/bun"; break; }
 done
 [ -n "$real" ] || { echo "bun: command not found" >&2; exit 127; }
 if [ -n "${FXC_LOCAL:-}" ] || ! command -v fx-cloud >/dev/null 2>&1; then

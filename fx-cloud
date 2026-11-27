@@ -1,32 +1,24 @@
 #!/usr/bin/env python3
-"""fx-cloud: run heavy commands in Vercel Sandboxes, and keep everything else on this Mac.
+"""fx-cloud: run heavy work in Vercel Sandboxes and keep everything else on this Mac.
 
-Each agent (fx, Claude Code, Codex, or a plain shell) gets its own sandbox for each folder it works
-in. The first command starts one from the base snapshot; later commands reuse it. A sandbox ends
-when the agent runs `fx-cloud done`, after `idle_minutes` without commands, or soon after the
-agent process that owns it ends. FXC_OWNER names another owner, for example a script.
+Each agent gets its own sandbox for each folder it works in. The first command starts one from the
+base snapshot; later commands reuse it. A sandbox ends when the agent runs `fx-cloud done`, when it
+is idle for FXC_IDLE_MINUTES (30), or soon after the fx process that owns it ends. The owner is the
+nearest fx process above the command (FXC_OWNER names another owner, for example a review run).
 
-Set up once:
-  fx-cloud init [--team TEAM] [--project PROJECT] [--prefix PREFIX]
-                             choose the Vercel team and project, and write the settings file
-  fx-cloud base [--no-warm] [--no-cpu-seeds] [--from SANDBOX]
-                             build the base snapshot that every sandbox starts from (`setup`
-                             does the same); run it again after you change tools or skills
-  fx-cloud login             optional sign-ins in the base: GitHub, and fx if you use it
-
-Run from the project folder:
+Run from the project folder on the Mac (fx uses these through its shell tool):
   fx-cloud run [--force] [--include PATH]... <command>
                                      copy this folder to the sandbox, then run the command there;
                                      output streams back and the exit code is the sandbox's
   fx-cloud run --no-push <command>   run without copying, for example to install a tool
   fx-cloud push [--force]            only copy this folder to the sandbox
+  fx-cloud agent [--resume ID] [--test-lane] [--include PATH]... "<task>"
+                                     hand a task to fx in the sandbox copy; prints its answer,
+                                     its session ID, and the files it changed
   fx-cloud pull --patch [--apply]    the sandbox copy's changes as a patch; --apply applies it here
   fx-cloud pull <path> [<dest>]      copy a file or folder from the sandbox copy to the Mac
   fx-cloud macos-build [zig args]    build a Zig project's macOS binary in the sandbox and put it
-                                     in this worktree's zig-out/bin
-  fx-cloud agent [--resume ID] [--include PATH]... "<task>"
-                                     hand a task to fx (`agent_command`) in the sandbox copy;
-                                     prints its answer, its session ID, and the files it changed
+                                     in this worktree's zig-out/bin, for hands-on checks on the Mac
 
 The copy lives at the same path in the sandbox.
 - A git worktree copy matches the Mac: the commit, uncommitted and new files. Ignored files stay on
@@ -38,24 +30,22 @@ The copy lives at the same path in the sandbox.
 A command that runs keeps its sandbox alive, however long it takes.
 
 Sandboxes:
-  fx-cloud done [--all]      remove this agent's sandbox for this folder (--all: every folder)
+  fx-cloud done [--all]      remove this agent's sandbox for this folder (--all: for every folder)
   fx-cloud ls                list the agent sandboxes, their owners and folders
-  fx-cloud gc [--all] [--dry-run]
-                             remove sandboxes whose agent or folder is gone (--all: every one)
+  fx-cloud gc [--all]        remove sandboxes whose agent or folder is gone (--all: every one)
   fx-cloud shell [--base]    open a shell in this agent's sandbox for this folder (or the base)
-  fx-cloud extend <time>     add time to this agent's sandbox, for example 1h
-  fx-cloud status            show the settings, the base snapshot and the agent sandboxes
-  fx-cloud base --remove     remove the base sandbox and its snapshots
+  fx-cloud status            show the base snapshot, the agent sandboxes, and both fx builds
+  fx-cloud base [--no-warm]  rebuild the base snapshot: toolchain, fx login, test key, warm caches
+                             (`setup` does the same)
+  fx-cloud login             one-time sign-ins in the base: fx login and the aig test key
 
-Settings: ~/.config/fx-cloud/config.json (FXC_CONFIG_DIR moves the folder). FXC_TEAM, FXC_PROJECT,
-FXC_PREFIX, FXC_VCPUS, FXC_IDLE_MINUTES and FXC_MAX_AGENTS override it. State is in
-~/.cache/fx-cloud (FXC_STATE_DIR).
+Settings come from FXC_TEAM, FXC_PROJECT, FXC_VCPUS (8), FXC_IDLE_MINUTES (30), FXC_MAX_AGENTS (24),
+FXC_OWNER and FXC_REMOTE_WS. FXC_SANDBOX=<name> sends every command to that one sandbox instead.
 """
 import base64
 import contextlib
 import fcntl
 import hashlib
-import importlib.util
 import json
 import os
 import platform
@@ -63,6 +53,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -70,17 +61,37 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-HOME = os.path.expanduser("~")
-with open(os.path.join(HERE, "remote", "fxc-remote.py"), "rb") as _helper:
-    PROTOCOL = hashlib.sha256(_helper.read()).hexdigest()[:12]  # must match the sandbox helper's own hash
-SHARE_REL = ".local/share/fx-cloud"  # the helper's folder in the sandbox, relative to its home
-NEEDS_PUSH = 75
-OLD_HELPER = 76
+TEAM = os.environ.get("FXC_TEAM", "vercel-internal-playground")
+PROJECT = os.environ.get("FXC_PROJECT", "fx-sandbox")
+# FXC_SANDBOX pins every command to one named sandbox, as before agent sandboxes existed.
+LEGACY = os.environ.get("FXC_SANDBOX", "")
+SANDBOX = LEGACY  # the sandbox this command uses; agent commands set it in use_sandbox()
+FALLBACK = "fx-dev"  # the shared sandbox, used only while no base snapshot exists
+AGENT_PREFIX = "fxa-"
+BASE_NAME = os.environ.get("FXC_BASE_SANDBOX", "fxc-base")
+AGENT_VCPUS = os.environ.get("FXC_VCPUS", "8")
+IDLE_MIN = max(5, int(os.environ.get("FXC_IDLE_MINUTES", "30")))
+MAX_AGENTS = int(os.environ.get("FXC_MAX_AGENTS", "24"))
 GC_EVERY_S = 600
 BASE_STALE_DAYS = 3
-BASE_TIMEOUT = "2h"  # the base sandbox's session while it is built
+WS = os.environ.get("FXC_REMOTE_WS", "/Users/faxes/Developer/Fx")
+MAC_WS = os.environ.get("FXC_MAC_WS", "/Users/faxes/Developer/Fx")
+HOME = os.path.expanduser("~")
+REMOTE_HOME = "/vercel"
+HELPER_REMOTE_PATH = REMOTE_HOME + "/.local/share/fx-cloud/fxc-remote.py"
+with open(os.path.join(HERE, "remote", "fxc-remote.py"), "rb") as _helper:
+    PROTOCOL = hashlib.sha256(_helper.read()).hexdigest()[:12]  # must match the sandbox helper's own hash
+NEEDS_PUSH = 75
+OLD_HELPER = 76
+LOST_STREAM = 77  # the exec stream ended before the helper sent the command's exit code
+TICK = "FXC::tick\n"  # the helper's keep-alive line; remote/fxc-remote.py has the same one
+GLOBAL_RULE_HEADING = "## Heavy commands run in"  # the Mac-only rule in ~/.fx/AGENTS.md
+STATE_DIR = os.path.join(HOME, ".cache", "fx-cloud")
+AGENTS_DIR = os.path.join(STATE_DIR, "agents")
+BASE_FILE = os.path.join(HOME, ".config", "fx-cloud", "base.json")
 # TLC's own working files (date-named state folders, trace specs) do not count on either side.
 # remote/fxc-remote.py has the same list; keep them equal.
 TLC_PATHSPECS = [":(exclude,glob)**/states/[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*/**",
@@ -89,67 +100,27 @@ PLAIN_LIMIT = 200 * 1024 * 1024
 # Folders that a one-way copy of a plain folder leaves out: build output and dependencies.
 PLAIN_SKIP = {".git", "node_modules", ".zig-cache", "zig-out", "__pycache__", ".venv", "venv",
               ".next", ".turbo", ".gradle", "target", ".DS_Store"}
+# Session clock. A pinned sandbox runs 5 h and gets 2 h more when less than 1 h is left. An agent
+# sandbox starts with IDLE_MIN and gets IDLE_MIN more when less than two thirds of that is left,
+# so it ends IDLE_MIN to about twice that after its last command. use_sandbox() sets these.
+SESSION_TIMEOUT_S = int(float(os.environ.get("FXC_TIMEOUT_HOURS", "5")) * 3600)
+EXTEND_WHEN_LEFT_S = 3600
+EXTEND_BY = "2h"
+EXTEND_BY_S = 7200
 TERM_ENV = ["--env", "TERM=xterm-256color", "--env", "COLORTERM=truecolor", "--env", "LANG=C.UTF-8"]
-INLINE_LIMIT = 48 * 1024
-# fx preferences that the base copies from ~/.fx/settings.json. Sign-ins are not among them.
-FX_SETTINGS_KEYS = [
+
+CREATE_FLAGS = [
+    "--vcpus", "8", "--timeout", "5h",
+    "--snapshot-expiration", "none",
+    "--keep-last-snapshots", "2", "--keep-last-snapshots-for", "none",
+]
+SETTINGS_KEYS = [
     "effort", "fast_mode", "fast_mode_model_bound", "permission_mode", "provider", "models",
     "update_channel", "credential_source", "theme", "ultrafast_mode", "collapse_tool_calls",
     "startup_scrollback", "yolo_acknowledged",
 ]
 SKILL_ROOTS = ["agents", "fx", "claude", "codex"]
 SKILL_SKIP = {".DS_Store", "node_modules", ".git", "__pycache__"}
-# Global rule files of the agents, relative to the home folder. The base copies them without the
-# block that install.sh --add-rule adds, because fx-cloud does not run inside the sandbox.
-RULE_FILES = [("fx", "AGENTS.md"), ("claude", "CLAUDE.md"), ("codex", "AGENTS.md")]
-RULE_START = "<!-- fx-cloud:start -->"
-RULE_END = "<!-- fx-cloud:end -->"
-# Agent programs that own sandboxes: the nearest one above a command is its owner.
-AGENT_PROGRAMS = ("fx", "claude", "codex")
-
-DEFAULTS = {
-    "team": None,
-    "project": None,
-    "prefix": "fxc-",
-    "vcpus": 8,
-    "idle_minutes": 30,
-    "max_agents": 24,
-    "local_only": [],
-    "warm": [],
-    "copy_skills": True,
-    "agent_command": ["fx"],
-    "setup_hook": None,
-}
-ENV_KEYS = {"FXC_TEAM": "team", "FXC_PROJECT": "project", "FXC_PREFIX": "prefix",
-            "FXC_VCPUS": "vcpus", "FXC_IDLE_MINUTES": "idle_minutes", "FXC_MAX_AGENTS": "max_agents"}
-PREFIX_RE = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
-CFG = dict(DEFAULTS)  # the settings of this command; main() loads them
-CONFIG_FOUND = False
-SANDBOX = ""  # the sandbox this command uses; use_sandbox() sets it
-# Session clock of an agent sandbox: it starts with idle_minutes and gets idle_minutes more when
-# less than two thirds of that is left, so it ends idle_minutes to about twice that after its last
-# command. set_agent_clock() sets these.
-SESSION_TIMEOUT_S = 30 * 60
-EXTEND_WHEN_LEFT_S = 30 * 40
-EXTEND_BY = "30m"
-EXTEND_BY_S = 30 * 60
-
-
-def configure_paths():
-    """Settings and state folders, from FXC_CONFIG_DIR and FXC_STATE_DIR when they are set."""
-    global CONFIG_DIR, CONFIG_FILE, BASE_FILE, STATE_DIR, AGENTS_DIR, PUSH_CACHE, PLAIN_CACHE
-    CONFIG_DIR = os.path.abspath(os.path.expanduser(
-        os.environ.get("FXC_CONFIG_DIR") or os.path.join(HOME, ".config", "fx-cloud")))
-    STATE_DIR = os.path.abspath(os.path.expanduser(
-        os.environ.get("FXC_STATE_DIR") or os.path.join(HOME, ".cache", "fx-cloud")))
-    CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-    BASE_FILE = os.path.join(CONFIG_DIR, "base.json")
-    AGENTS_DIR = os.path.join(STATE_DIR, "agents")
-    PUSH_CACHE = os.path.join(STATE_DIR, "pushed")
-    PLAIN_CACHE = os.path.join(STATE_DIR, "plain")
-
-
-configure_paths()
 
 
 def say(msg):
@@ -161,146 +132,22 @@ def die(msg, code=1):
     sys.exit(code)
 
 
-def short(path):
-    """PATH with the home folder written as ~."""
-    if path == HOME or path.startswith(HOME + os.sep):
-        return "~" + path[len(HOME):]
-    return path
-
-
-def write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = "%s.%d.tmp" % (path, os.getpid())
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=1)
-        f.write("\n")
-    os.replace(tmp, path)
-
-
-# --------------------------------------------------------------------------- settings
-
-class ConfigError(Exception):
-    pass
-
-
-def not_set_up():
-    return "fx-cloud is not set up yet: run `fx-cloud init` (there is no %s)" % short(CONFIG_FILE)
-
-
-def as_int(key, value, low):
-    if isinstance(value, bool):
-        raise ConfigError("%s must be a whole number" % key)
-    try:
-        n = int(str(value).strip())
-    except ValueError:
-        raise ConfigError("%s must be a whole number, not %r" % (key, value)) from None
-    if n < low:
-        raise ConfigError("%s must be at least %d" % (key, low))
-    return n
-
-
-def str_list(key, value, allow_empty=True):
-    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
-        raise ConfigError("%s must be a list of strings" % key)
-    if not value and not allow_empty:
-        raise ConfigError("%s must not be empty" % key)
-    return [v.strip() for v in value]
-
-
-def check_config(raw, required=True):
-    """The settings in RAW on top of the defaults, checked and normalized. REQUIRED needs a team
-    and a project."""
-    cfg = dict(DEFAULTS)
-    cfg.update(raw)
-    for key in ("team", "project"):
-        v = cfg[key]
-        if v is not None and not isinstance(v, str):
-            raise ConfigError("%s must be a string" % key)
-        cfg[key] = (v or "").strip() or None
-        if required and not cfg[key]:
-            raise ConfigError("%s is not set; run `fx-cloud init`" % key)
-    if not isinstance(cfg["prefix"], str) or not PREFIX_RE.match(cfg["prefix"]):
-        raise ConfigError("prefix must be 1 to 16 lowercase letters, digits or dashes that start with "
-                          "a letter, such as fxc-")
-    cfg["vcpus"] = as_int("vcpus", cfg["vcpus"], 1)
-    cfg["idle_minutes"] = as_int("idle_minutes", cfg["idle_minutes"], 5)
-    cfg["max_agents"] = as_int("max_agents", cfg["max_agents"], 1)
-    cfg["local_only"] = str_list("local_only", cfg["local_only"])
-    if isinstance(cfg["agent_command"], str):
-        cfg["agent_command"] = shlex.split(cfg["agent_command"])
-    cfg["agent_command"] = str_list("agent_command", cfg["agent_command"], allow_empty=False)
-    if not isinstance(cfg["warm"], list):
-        raise ConfigError('warm must be a list of {"repo": "<git url>", "run": ["<command>", ...]}')
-    warm = []
-    for i, w in enumerate(cfg["warm"]):
-        if not isinstance(w, dict) or not isinstance(w.get("repo"), str) or not w["repo"].strip():
-            raise ConfigError('warm[%d] needs a "repo" git URL' % i)
-        warm.append({"repo": w["repo"].strip(), "run": str_list("warm[%d].run" % i, w.get("run", []))})
-    cfg["warm"] = warm
-    if not isinstance(cfg["copy_skills"], bool):
-        raise ConfigError("copy_skills must be true or false")
-    hook = cfg["setup_hook"]
-    if hook is not None and not isinstance(hook, str):
-        raise ConfigError("setup_hook must be the path of a script, or null")
-    cfg["setup_hook"] = os.path.abspath(os.path.expanduser(hook.strip())) if hook and hook.strip() else None
-    return cfg
-
-
-def load_config(required=True):
-    """(settings, found): config.json with the FXC_* environment variables on top. Without a
-    config file, REQUIRED raises ConfigError that points to `fx-cloud init`."""
-    try:
-        with open(CONFIG_FILE) as f:
-            raw = json.load(f)
-        found = True
-    except FileNotFoundError:
-        if required:
-            raise ConfigError(not_set_up()) from None
-        raw, found = {}, False
-    except (OSError, ValueError) as e:
-        raise ConfigError("cannot read %s: %s" % (short(CONFIG_FILE), e)) from None
-    if not isinstance(raw, dict):
-        raise ConfigError("%s must hold a JSON object" % short(CONFIG_FILE))
-    unknown = sorted(set(raw) - set(DEFAULTS))
-    if unknown:
-        say("note: %s has settings that fx-cloud does not know: %s" % (short(CONFIG_FILE), ", ".join(unknown)))
-    raw = {k: v for k, v in raw.items() if k in DEFAULTS}
-    for var, key in ENV_KEYS.items():
-        if os.environ.get(var, "").strip():
-            raw[key] = os.environ[var].strip()
-    try:
-        return check_config(raw, required=required), found
-    except ConfigError as e:
-        raise ConfigError("%s (in %s or its FXC_ variables)" % (e, short(CONFIG_FILE))) from None
-
-
-def setup_config(required=True):
-    global CFG, CONFIG_FOUND
-    try:
-        CFG, CONFIG_FOUND = load_config(required)
-    except ConfigError as e:
-        die(str(e))
-
-
-def need_config(tool=None):
-    """Stops a shim's remote route with a clear message when fx-cloud is not set up."""
-    hint = ", or set FXC_LOCAL=1 to run %s here" % tool if tool else ""
-    if not CONFIG_FOUND:
-        die(not_set_up() + hint)
-    if not (CFG.get("team") and CFG.get("project")):
-        die("%s has no team or project; run `fx-cloud init`%s" % (short(CONFIG_FILE), hint))
-    if shutil.which("vercel") is None:
-        die("the Vercel CLI is missing; install it with `npm i -g vercel`%s" % hint)
-
-
 def vercel(sub, *args):
-    subs = [sub] if isinstance(sub, str) else list(sub)
-    return ["vercel", "sandbox"] + subs + ["--scope", CFG["team"], "--project", CFG["project"]] + list(args)
+    return ["vercel", "sandbox", sub, "--scope", TEAM, "--project", PROJECT] + list(args)
 
 
 def remote_cmd(script, interactive=False, env=None):
     flags = (["-i"] if interactive else []) + (env or [])
     return vercel("exec", *flags, SANDBOX, "--", "bash", "-lc", script)
+
+
+def run_remote(script, check=True):
+    """Runs a script in the sandbox and returns its stdout. stderr carries the CLI's own banner."""
+    p = subprocess.run(remote_cmd(script), capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.stderr.write(p.stderr[-4000:])
+        die("sandbox command failed (exit %d): %s" % (p.returncode, script[:120]))
+    return p
 
 
 def interactive(script, extra_env=None):
@@ -313,6 +160,14 @@ def interactive(script, extra_env=None):
         return child.wait()
     finally:
         signal.signal(signal.SIGINT, previous)
+
+
+def sandbox_exists():
+    p = subprocess.run(vercel("list"), capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(p.stdout[-2000:] + p.stderr[-2000:])
+        die("cannot list sandboxes; check `vercel login`")
+    return any(line.split()[:1] == [SANDBOX] for line in p.stdout.splitlines())
 
 
 # --------------------------------------------------------------------------- agent sandboxes
@@ -329,45 +184,29 @@ def ps_table():
     return procs
 
 
-def agent_program(cmd):
-    """fx, claude or codex when command line CMD is that agent (also when Node runs it), else None.
-    fx's own command helpers do not count."""
-    words = cmd.split()
-    if not words or "__fx_foreground_session__" in cmd:
-        return None
-    names = [os.path.basename(words[0])]
-    if names[0] in ("node", "bun") and len(words) > 1:
-        names.append(os.path.basename(words[1]))
-    for name in names:
-        name = re.sub(r"\.[cm]?js$", "", name)
-        if name in AGENT_PROGRAMS:
-            return name
-    return None
-
-
-def find_owner(procs=None, start_pid=None):
-    """The agent process that runs this command: the nearest fx, claude or codex above us. fx keeps
-    its PID and start time when it restarts itself for an update."""
+def find_owner(procs=None):
+    """The fx process that runs this command: the nearest fx above us that is not a command
+    helper. fx keeps its PID and start time when it restarts itself for an update."""
     procs = ps_table() if procs is None else procs
-    pid, hops = (os.getppid() if start_pid is None else start_pid), 0
+    pid, hops = os.getppid(), 0
     while pid > 1 and pid in procs and hops < 64:
         ppid, start, cmd = procs[pid]
-        prog = agent_program(cmd)
-        if prog:
-            return {"pid": pid, "start": start, "cmd": cmd[:160], "prog": prog}
+        words = cmd.split()
+        if words and os.path.basename(words[0]) == "fx" and "__fx_foreground_session__" not in cmd:
+            return {"pid": pid, "start": start, "cmd": cmd[:160]}
         pid, hops = ppid, hops + 1
     return None
 
 
 def current_owner():
-    """(owner id, owner process or None). FXC_OWNER wins. Without an agent above us the owner is the
+    """(owner id, owner process or None). FXC_OWNER wins. Without an fx above us the owner is the
     shell; then only the idle timeout and `fx-cloud done` end its sandboxes."""
     named = os.environ.get("FXC_OWNER", "").strip()
     if named:
         return "named:" + named, None
     owner = find_owner()
     if owner:
-        return "%s:%d@%s" % (owner["prog"], owner["pid"], owner["start"]), owner
+        return "fx:%d@%s" % (owner["pid"], owner["start"]), owner
     return "shell", None
 
 
@@ -379,19 +218,7 @@ def folder_root(path):
 
 
 def agent_name(owner_id, root):
-    key = "\0".join((CFG["team"] or "", CFG["project"] or "", owner_id, root))
-    return CFG["prefix"] + hashlib.sha1(key.encode()).hexdigest()[:12]
-
-
-def is_agent_name(name):
-    """True for the agent sandboxes of this prefix: the prefix and 12 hex digits. Base and probe
-    sandboxes, and every other name, never match."""
-    prefix = CFG["prefix"]
-    return name.startswith(prefix) and re.fullmatch(r"[0-9a-f]{12}", name[len(prefix):]) is not None
-
-
-def is_base_name(name):
-    return name.startswith(CFG["prefix"] + "base-")
+    return AGENT_PREFIX + hashlib.sha1((owner_id + "\0" + root).encode()).hexdigest()[:12]
 
 
 def entry_path(name):
@@ -401,24 +228,23 @@ def entry_path(name):
 def read_entry(name):
     try:
         with open(entry_path(name)) as f:
-            e = json.load(f)
+            return json.load(f)
     except (OSError, ValueError):
         return None
-    if not isinstance(e, dict) or e.get("name") != name or not is_agent_name(name) \
-            or e.get("team") != CFG["team"] or e.get("project") != CFG["project"]:
-        return None
-    return e
 
 
 def write_entry(entry):
-    write_json(entry_path(entry["name"]), entry)
+    os.makedirs(AGENTS_DIR, exist_ok=True)
+    tmp = "%s.%d.tmp" % (entry_path(entry["name"]), os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(entry, f, indent=1)
+    os.replace(tmp, entry_path(entry["name"]))
 
 
 def all_entries():
-    """This Mac's agent sandboxes for the configured team, project and prefix."""
     names = sorted(n[:-5] for n in os.listdir(AGENTS_DIR) if n.endswith(".json")) \
         if os.path.isdir(AGENTS_DIR) else []
-    return [e for e in (read_entry(n) for n in names if is_agent_name(n)) if e]
+    return [e for e in (read_entry(n) for n in names) if e]
 
 
 @contextlib.contextmanager
@@ -438,17 +264,11 @@ def file_lock(path, wait=True):
 
 
 def read_base():
-    """The base snapshot of the configured team, project and prefix, or None."""
     try:
         with open(BASE_FILE) as f:
-            base = json.load(f)
+            return json.load(f)
     except (OSError, ValueError):
         return None
-    if not isinstance(base, dict) or not base.get("snapshot") or (
-            base.get("team"), base.get("project"), base.get("prefix")) != (
-            CFG["team"], CFG["project"], CFG["prefix"]):
-        return None
-    return base
 
 
 def ago(ts):
@@ -481,26 +301,25 @@ def drop_local_state(name):
 
 def create_agent_sandbox(name, owner_id, owner, root, base):
     live = [e for e in all_entries() if e["name"] != name]
-    if len(live) >= CFG["max_agents"]:
+    if len(live) >= MAX_AGENTS:
         # Its lines go to gc.log, as from the background gc: this output is the agent's command output.
         os.makedirs(STATE_DIR, exist_ok=True)
-        log_path = os.path.join(STATE_DIR, "gc.log")
-        with open(log_path, "a") as log, contextlib.redirect_stdout(log):
+        with open(os.path.join(STATE_DIR, "gc.log"), "a") as log, contextlib.redirect_stdout(log):
             doomed, failed = run_gc(quiet=True)
-        say("%d agent sandboxes is the limit; removed %d that no agent needs (%s)"
-            % (CFG["max_agents"], len(doomed) - len(failed), short(log_path)))
+        say("%d agent sandboxes is the limit; removed %d that no agent needs (~/.cache/fx-cloud/gc.log)"
+            % (MAX_AGENTS, len(doomed) - len(failed)))
         live = [e for e in all_entries() if e["name"] != name]
-        if len(live) >= CFG["max_agents"]:
-            say("note: %d agent sandboxes are open (max_agents is %d); `fx-cloud ls` lists them"
-                % (len(live), CFG["max_agents"]))
-    say("starting this agent's sandbox for %s (%s, %d vCPUs, from the base snapshot)"
-        % (short(root), name, CFG["vcpus"]))
+        if len(live) >= MAX_AGENTS:
+            say("note: %d agent sandboxes are open (FXC_MAX_AGENTS is %d); `fx-cloud ls` lists them"
+                % (len(live), MAX_AGENTS))
+    say("starting this agent's sandbox for %s (%s, %s vCPUs, from the base snapshot)"
+        % (root.replace(HOME, "~"), name, AGENT_VCPUS))
     t0 = time.time()
     # A create can fail for a short time, for example with 403 Not authorized for about a minute
-    # after a new base snapshot, so it gets two more tries.
+    # after a new base snapshot (seen Nov 12, 2026), so it gets two more tries.
     for wait in (5, 15, None):
         p = subprocess.run(vercel("create", "--name", name, "--snapshot", base["snapshot"], "--non-persistent",
-                                  "--vcpus", str(CFG["vcpus"]), "--timeout", "%dm" % CFG["idle_minutes"],
+                                  "--vcpus", AGENT_VCPUS, "--timeout", "%dm" % IDLE_MIN,
                                   "--tag", "fxc=agent", "--silent"), capture_output=True, text=True)
         if p.returncode == 0 or "already" in (p.stdout + p.stderr).lower():
             break
@@ -512,11 +331,9 @@ def create_agent_sandbox(name, owner_id, owner, root, base):
         say("starting the sandbox failed (%s); trying again in %d s" % (why[:120], wait))
         time.sleep(wait)
     now = time.time()
-    write_entry({"name": name, "team": CFG["team"], "project": CFG["project"], "owner": owner_id,
-                 "owner_pid": owner["pid"] if owner else None, "owner_start": owner["start"] if owner else None,
-                 "owner_prog": owner["prog"] if owner else "", "owner_cmd": owner["cmd"] if owner else "",
-                 "root": root, "created": now, "used": now, "snapshot": base["snapshot"],
-                 "idle_min": CFG["idle_minutes"]})
+    write_entry({"name": name, "owner": owner_id, "owner_pid": owner["pid"] if owner else None,
+                 "owner_start": owner["start"] if owner else None, "owner_cmd": owner["cmd"] if owner else "",
+                 "root": root, "created": now, "used": now, "snapshot": base["snapshot"], "idle_min": IDLE_MIN})
     say("the sandbox is ready after %.0f s" % (now - t0))
     days = (now - base.get("created", now)) / 86400
     if days > BASE_STALE_DAYS:
@@ -525,8 +342,19 @@ def create_agent_sandbox(name, owner_id, owner, root, base):
 
 def use_sandbox(root, create=True):
     """Points this command at its agent's sandbox for ROOT, and starts that sandbox when needed.
-    Returns the sandbox's entry, or None when CREATE is false and none exists."""
+    Returns the sandbox's entry, or None for a pinned sandbox or when CREATE is false and none
+    exists."""
     global SANDBOX
+    if LEGACY:
+        SANDBOX = LEGACY
+        return None
+    base = read_base()
+    if not base:
+        if fallback_removed():
+            die("there is no base snapshot; run: fx-cloud base")
+        SANDBOX = FALLBACK
+        say("note: no base snapshot yet, so this runs in the shared sandbox %s; run fx-cloud base" % FALLBACK)
+        return None
     owner_id, owner = current_owner()
     name = agent_name(owner_id, root)
     SANDBOX = name
@@ -534,10 +362,6 @@ def use_sandbox(root, create=True):
     if entry is None:
         if not create:
             return None
-        base = read_base()
-        if not base:
-            die("there is no base snapshot for %s/%s yet; run `fx-cloud base` (about a minute, more with warm builds)"
-                % (CFG["team"], CFG["project"]))
         with file_lock(os.path.join(AGENTS_DIR, name + ".lock")):
             entry = read_entry(name)  # a parallel command of the same agent may have started it
             if entry is None:
@@ -546,7 +370,7 @@ def use_sandbox(root, create=True):
     elif time.time() - entry.get("used", 0) > 60:
         entry["used"] = time.time()
         write_entry(entry)
-    set_agent_clock(entry.get("idle_min", CFG["idle_minutes"]))
+    set_agent_clock(entry.get("idle_min", IDLE_MIN))
     maybe_background_gc()
     return entry
 
@@ -595,50 +419,29 @@ def maybe_background_gc():
     detach([sys.executable, os.path.realpath(__file__), "gc", "--quiet"], os.path.join(STATE_DIR, "gc.log"))
 
 
-def parse_sandbox_rows(text):
-    """(name, status, snapshot) for each row of `vercel sandbox list`."""
-    rows = []
-    for line in text.splitlines():
-        w = line.split()
-        if len(w) >= 2 and re.fullmatch(r"[a-z0-9][a-z0-9-]*", w[0]):
-            m = re.search(r"\bsnap_[A-Za-z0-9]+", line)
-            rows.append((w[0], w[1], m.group(0) if m else None))
-    return rows
-
-
-def list_sandboxes(prefix):
-    """(name, status, snapshot) of every sandbox whose name starts with PREFIX, or None when the
-    list fails. The API returns at most 50 per page and prints a --cursor hint when there are more."""
-    rows, cursor = [], None
-    for _ in range(40):
-        p = subprocess.run(vercel("list", "--all", "--name-prefix", prefix, "--limit", "50",
+def list_remote():
+    """name -> status of every agent sandbox in the project, or None when the list fails. The API
+    returns at most 50 per page and prints a --cursor hint when there are more."""
+    out, cursor = {}, None
+    for _ in range(20):
+        p = subprocess.run(vercel("list", "--all", "--name-prefix", AGENT_PREFIX, "--limit", "50",
                                   *(["--cursor", cursor] if cursor else [])), capture_output=True, text=True)
         if p.returncode != 0:
             return None
-        rows += [r for r in parse_sandbox_rows(p.stdout) if r[0].startswith(prefix)]
+        for line in p.stdout.splitlines():
+            w = line.split()
+            if len(w) >= 2 and w[0].startswith(AGENT_PREFIX):
+                out[w[0]] = w[1]
         m = re.search(r"--cursor[= ]+['\"]?([A-Za-z0-9_\-=.]+)", p.stdout + p.stderr)
         if not m or m.group(1) == cursor:
             break
         cursor = m.group(1)
-    return rows
-
-
-def list_agents():
-    """name -> (status, snapshot) of the agent sandboxes of this prefix, or None when the list fails."""
-    rows = list_sandboxes(CFG["prefix"])
-    return None if rows is None else {n: (s, snap) for n, s, snap in rows if is_agent_name(n)}
-
-
-def list_remote():
-    """name -> status of the agent sandboxes of this prefix, or None when the list fails."""
-    agents = list_agents()
-    return None if agents is None else {n: s for n, (s, _) in agents.items()}
+    return out
 
 
 def remove_sandboxes(names):
-    """Removes agent sandboxes and forgets them on this Mac. Returns the names it could not remove.
-    Names that are not agent sandboxes of this prefix are never removed."""
-    names = sorted(n for n in set(names) if is_agent_name(n))
+    """Removes sandboxes and forgets them on this Mac. Returns the names it could not remove."""
+    names = sorted(set(names))
     if not names:
         return []
     failed = []
@@ -664,49 +467,31 @@ def owner_alive(entry, procs):
 STOPPED = ("stopped", "failed", "aborted", "error")
 
 
-def gc_plan(entries, remote, procs, everything=False):
-    """(doomed: name -> reason, forget: entries to drop locally). REMOTE is name -> status, or
-    None when the list failed."""
-    doomed, forget = {}, []
+def run_gc(everything=False, quiet=False):
+    """Removes the agent sandboxes that no agent needs: the fx process that owns one ended, its
+    folder is gone, or it stopped after being idle. EVERYTHING removes every agent sandbox."""
+    procs, entries, remote = ps_table(), all_entries(), list_remote()
+    doomed = {}
     for e in entries:
         n = e["name"]
         if remote is not None and n not in remote and time.time() - e.get("created", 0) > 300:
-            forget.append(n)  # already removed elsewhere
+            drop_local_state(n)  # already removed elsewhere
         elif everything:
             doomed[n] = "asked"
         elif not owner_alive(e, procs):
-            doomed[n] = "its %s process ended" % (e.get("owner_prog") or "agent")
+            doomed[n] = "its fx process ended"
         elif not os.path.isdir(e["root"]):
             doomed[n] = "its folder is gone"
         elif remote and remote.get(n) in STOPPED:
-            doomed[n] = "it stopped after %d idle minutes" % e.get("idle_min", CFG["idle_minutes"])
+            doomed[n] = "it stopped after %d idle minutes" % IDLE_MIN
     known = {e["name"] for e in entries}
     for n, status in (remote or {}).items():
-        if is_agent_name(n) and n not in known and (everything or status in STOPPED):
+        if n not in known and (everything or status in STOPPED):
             doomed[n] = "no agent on this Mac uses it"
-    return doomed, forget
-
-
-def run_gc(everything=False, quiet=False, dry_run=False):
-    """Removes the agent sandboxes that no agent needs: the agent process that owns one ended, its
-    folder is gone, or it stopped after being idle. EVERYTHING removes every agent sandbox."""
-    procs, entries, agents = ps_table(), all_entries(), list_agents()
-    remote = None if agents is None else {n: s for n, (s, _) in agents.items()}
-    doomed, forget = gc_plan(entries, remote, procs, everything)
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    if dry_run:
-        for n, why in sorted(doomed.items()):
-            print("would remove %s: %s" % (n, why))
-        if not doomed:
-            print("nothing to remove")
-        return doomed, []
-    for n in forget:
-        drop_local_state(n)
     failed = remove_sandboxes(list(doomed))
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     for n, why in sorted(doomed.items()):
         print("%s %s %s: %s" % (stamp, "could not remove" if n in failed else "removed", n, why))
-    if agents is not None:
-        clean_old_bases({n: v for n, v in agents.items() if n not in doomed or n in failed}, quiet)
     if quiet:
         print("%s gc: %d agent sandboxes known, %d running, %d removed" % (
             stamp, len(entries), sum(1 for s in (remote or {}).values() if s == "running"),
@@ -717,17 +502,13 @@ def run_gc(everything=False, quiet=False, dry_run=False):
 
 
 def cmd_gc(args):
-    flags, rest = take_flags(args, ("--all", "--quiet", "--dry-run"))
-    if rest:
-        die("usage: fx-cloud gc [--all] [--dry-run]", 2)
     log = os.path.join(STATE_DIR, "gc.log")
-    if flags.get("--quiet") and os.path.exists(log) and os.path.getsize(log) > 1 << 20:
+    if "--quiet" in args and os.path.exists(log) and os.path.getsize(log) > 1 << 20:
         os.replace(log, log + ".old")
-    with file_lock(os.path.join(STATE_DIR, "gc.lock"), wait=not flags.get("--quiet")) as held:
+    with file_lock(os.path.join(STATE_DIR, "gc.lock"), wait="--quiet" not in args) as held:
         if not held:
             return 0  # another gc runs now
-        _, failed = run_gc(everything=bool(flags.get("--all")), quiet=bool(flags.get("--quiet")),
-                           dry_run=bool(flags.get("--dry-run")))
+        _, failed = run_gc(everything="--all" in args, quiet="--quiet" in args)
     return 1 if failed else 0
 
 
@@ -737,33 +518,32 @@ def cmd_ls(_args):
     if not entries and not remote:
         print("no agent sandboxes")
         return 0
-    print("%-17s %-8s %-28s %-6s %-6s %s" % ("SANDBOX", "STATE", "AGENT", "AGE", "IDLE", "FOLDER"))
+    print("%-16s %-8s %-28s %-6s %-6s %s" % ("SANDBOX", "STATE", "AGENT", "AGE", "IDLE", "FOLDER"))
     for e in sorted(entries, key=lambda e: e.get("created", 0)):
         if e.get("owner_pid"):
-            agent = "%s %d (%s)" % (e.get("owner_prog") or "agent", e["owner_pid"],
-                                    "running" if owner_alive(e, procs) else "ended")
+            agent = "fx %d (%s)" % (e["owner_pid"], "running" if owner_alive(e, procs) else "ended")
         else:
             agent = e.get("owner", "").replace("named:", "")
-        print("%-17s %-8s %-28s %-6s %-6s %s" % (e["name"], remote.get(e["name"], "gone"), agent[:28],
-                                                 ago(e.get("created")), ago(e.get("used")), short(e["root"])))
+        print("%-16s %-8s %-28s %-6s %-6s %s" % (e["name"], remote.get(e["name"], "gone"), agent[:28],
+                                                 ago(e.get("created")), ago(e.get("used")),
+                                                 e["root"].replace(HOME, "~")))
     for n, status in sorted(remote.items()):
         if n not in known:
-            print("%-17s %-8s %-28s" % (n, status, "(not known on this Mac)"))
+            print("%-16s %-8s %-28s" % (n, status, "(not known on this Mac)"))
     return 0
 
 
 def cmd_done(args):
-    flags, rest = take_flags(args, ("--all",))
-    if rest:
-        die("usage: fx-cloud done [--all]", 2)
+    if LEGACY:
+        die("FXC_SANDBOX is set; `fx-cloud done` removes only agent sandboxes")
     owner_id, _ = current_owner()
-    if flags.get("--all"):
+    if "--all" in args:
         names = [e["name"] for e in all_entries() if e.get("owner") == owner_id]
     else:
         name = agent_name(owner_id, folder_root(os.getcwd()))
         names = [name] if read_entry(name) else []
     if not names:
-        say("this agent has no sandbox%s" % ("" if flags.get("--all") else " for this folder"))
+        say("this agent has no sandbox%s" % ("" if "--all" in args else " for this folder"))
         return 0
     failed = remove_sandboxes(names)
     for n in names:
@@ -771,73 +551,12 @@ def cmd_done(args):
     return 1 if failed else 0
 
 
-# --------------------------------------------------------------------------- the base
+# --------------------------------------------------------------------------- setup
 
-def is_fx_cloud_shim(path):
-    try:
-        with open(path, "rb") as f:
-            head = f.read(4096)
-    except OSError:
-        return False
-    return b"exec fx-cloud " in head
-
-
-def real_tool(name):
-    """The first NAME in PATH that is not one of fx-cloud's shims."""
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        path = os.path.join(d, name) if d else ""
-        if path and os.path.isfile(path) and os.access(path, os.X_OK) and not is_fx_cloud_shim(path):
-            return path
-    return None
-
-
-def quiet_output(argv):
-    """ARGV's stdout without its last newline, or "" when it fails."""
-    try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=30,
-                           env=dict(os.environ, FXC_LOCAL="1"))
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return p.stdout.strip() if p.returncode == 0 else ""
-
-
-def mac_facts():
-    """What the base takes from this Mac: the home folder, the Zig, Bun and fx it uses, and the
-    git name and email."""
-    facts = {"home": HOME, "zig": "", "bun": "", "fx": False, "fx_channel": "", "git_name": "",
-             "git_email": ""}
-    for tool, args in (("zig", ["version"]), ("bun", ["--version"])):
-        path = real_tool(tool)
-        version = quiet_output([path] + args) if path else ""
-        if re.fullmatch(r"\d+\.\d+\.\d+[0-9A-Za-z.+-]*", version):
-            facts[tool] = version
-    fx = real_tool("fx")
-    if fx:
-        facts["fx"] = True
-        try:
-            channel = json.loads(quiet_output([fx, "status", "--json"]) or "{}").get("build_channel") or ""
-        except (ValueError, AttributeError):
-            channel = ""
-        facts["fx_channel"] = channel if re.fullmatch(r"[a-z]+", channel) else ""
-    facts["git_name"] = quiet_output(["git", "config", "--get", "user.name"])
-    facts["git_email"] = quiet_output(["git", "config", "--get", "user.email"])
-    return facts
-
-
-def strip_rule_block(text):
-    """TEXT without the fx-cloud rule block that install.sh --add-rule adds."""
-    while RULE_START in text:
-        start = text.index(RULE_START)
-        end = text.find(RULE_END, start)
-        end = len(text) if end < 0 else end + len(RULE_END)
-        text = text[:start].rstrip("\n") + "\n\n" + text[end:].lstrip("\n")
-    return text.strip("\n") + "\n" if text.strip() else ""
-
-
-def add_tree(tar, root, arc_prefix="", skip_top=()):
+def add_tree(tar, root, arc_prefix=""):
     """Adds a skills folder, following symlinks and skipping broken ones and build clutter."""
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        dirnames[:] = [d for d in dirnames if d not in SKILL_SKIP and not (dirpath == root and d in skip_top)]
+        dirnames[:] = [d for d in dirnames if d not in SKILL_SKIP]
         for name in filenames:
             if name in SKILL_SKIP:
                 continue
@@ -854,66 +573,77 @@ def add_tree(tar, root, arc_prefix="", skip_top=()):
                 tar.addfile(info, f)
 
 
-def build_bundle(tmp, facts):
-    """The setup bundle: the remote scripts, what the base takes from this Mac, the warm list, the
-    skills and rule files, and the setup hook."""
+def strip_section(text, heading):
+    """Removes one `## ` section, so the sandbox copy of the global rules skips the Mac-only rule."""
+    start = text.find(heading)
+    if start < 0:
+        return text
+    end = text.find("\n## ", start + len(heading))
+    return text[:start].rstrip("\n") + ("\n\n" + text[end + 1:] if end >= 0 else "\n")
+
+
+def build_bundle(tmp):
     b = os.path.join(tmp, "fxc")
     shutil.copytree(os.path.join(HERE, "remote"), os.path.join(b, "remote"))
     mac = os.path.join(b, "mac")
-    os.makedirs(os.path.join(mac, "rules"))
-    write_json(os.path.join(mac, "facts.json"), facts)
-    for i, w in enumerate(CFG["warm"]):
-        d = os.path.join(mac, "warm", "%02d" % i)
-        os.makedirs(d)
-        with open(os.path.join(d, "repo"), "w") as f:
-            f.write(w["repo"] + "\n")
-        with open(os.path.join(d, "run"), "w") as f:
-            f.write("".join(c + "\n" for c in w["run"]))
-    settings_path = os.path.join(HOME, ".fx", "settings.json")
-    if facts["fx"] and os.path.isfile(settings_path):
-        try:
-            with open(settings_path) as f:
-                settings = json.load(f)
-            write_json(os.path.join(mac, "fx-settings.json"),
-                       {k: settings[k] for k in FX_SETTINGS_KEYS if k in settings})
-        except (OSError, ValueError, TypeError):
-            say("note: could not read %s; the base uses fx's default settings" % short(settings_path))
-    for tool, fname in RULE_FILES:
-        if not os.path.isdir(os.path.join(HOME, "." + tool)) and not (tool == "fx" and facts["fx"]):
-            continue
-        text = ""
-        if CFG["copy_skills"]:
-            try:
-                with open(os.path.join(HOME, "." + tool, fname), errors="replace") as f:
-                    text = strip_rule_block(f.read())
-            except OSError:
-                pass
-        with open(os.path.join(mac, "rules", "%s-%s" % (tool, fname)), "w") as f:
-            f.write(text)
-    if CFG["copy_skills"]:
-        skills = os.path.join(b, "skills")
-        os.makedirs(skills)
-        for root in SKILL_ROOTS:
-            src = os.path.join(HOME, "." + root, "skills")
-            if os.path.isdir(src):
-                with tarfile.open(os.path.join(skills, root + ".tgz"), "w:gz") as tar:
-                    add_tree(tar, src, skip_top=("fx-cloud",))  # this skill is for the Mac only
-    if CFG["setup_hook"]:
-        os.makedirs(os.path.join(b, "hook"))
-        shutil.copy(CFG["setup_hook"], os.path.join(b, "hook", "setup-hook"))
+    os.makedirs(mac)
+    shutil.copy(os.path.join(MAC_WS, "AGENTS.md"), os.path.join(mac, "workspace-AGENTS.md"))
+    with open(os.path.join(HOME, ".fx", "AGENTS.md")) as f:
+        global_rules = f.read()
+    with open(os.path.join(mac, "global-AGENTS.md"), "w") as f:
+        f.write(strip_section(global_rules, GLOBAL_RULE_HEADING))
+    shutil.copy(os.path.join(HOME, ".local", "bin", "aig"), os.path.join(mac, "aig"))
+    if os.path.exists(os.path.join(MAC_WS, ".fx.json")):
+        shutil.copy(os.path.join(MAC_WS, ".fx.json"), os.path.join(mac, "fx.json"))
+    with open(os.path.join(HOME, ".fx", "settings.json")) as f:
+        settings = json.load(f)
+    with open(os.path.join(mac, "settings.json"), "w") as f:
+        json.dump({k: settings[k] for k in SETTINGS_KEYS if k in settings}, f, indent=2)
+    skills = os.path.join(b, "skills")
+    os.makedirs(skills)
+    for root in SKILL_ROOTS:
+        src = os.path.join(HOME, "." + root, "skills")
+        if os.path.isdir(src):
+            with tarfile.open(os.path.join(skills, root + ".tgz"), "w:gz") as tar:
+                add_tree(tar, src)
     bundle = os.path.join(tmp, "fxc-bundle.tgz")
     with tarfile.open(bundle, "w:gz") as tar:
         tar.add(b, arcname="fxc")
     return bundle
 
 
+def cmd_setup(args):
+    if not LEGACY:
+        return cmd_base(args)
+    warm = "--no-warm" not in args
+    if not sandbox_exists():
+        say("creating sandbox %s in %s/%s" % (SANDBOX, TEAM, PROJECT))
+        rc = subprocess.call(vercel("create", "--name", SANDBOX, *CREATE_FLAGS))
+        if rc != 0:
+            die("sandbox create failed")
+    with tempfile.TemporaryDirectory() as tmp:
+        bundle = build_bundle(tmp)
+        say("uploading setup bundle (%.1f MB)" % (os.path.getsize(bundle) / 1e6))
+        rc = subprocess.call(vercel("copy", bundle, "%s:/tmp/fxc-bundle.tgz" % SANDBOX),
+                             stdout=subprocess.DEVNULL)
+        if rc != 0:
+            die("upload failed")
+    script = ("rm -rf /tmp/fxc && mkdir -p /tmp && tar -xzf /tmp/fxc-bundle.tgz -C /tmp "
+              "&& bash /tmp/fxc/remote/setup.sh /tmp/fxc %s" % ("" if warm else "--no-warm"))
+    rc = subprocess.call(remote_cmd(script))
+    if rc != 0:
+        die("setup failed (exit %d)" % rc)
+    say("setup done. If this is the first setup, run: fx-cloud login")
+
+
 # The sign-ins that a new base takes over from the old one, relative to the sandbox home.
-CRED_FILES = [".fx/auth.json", ".fx/settings.json", ".config/gh/hosts.yml", ".config/gh/config.yml"]
+CRED_FILES = [".fx/auth.json", ".fx/settings.json", ".config/gh/hosts.yml", ".config/gh/config.yml",
+              ".config/ai-gateway/project-fx.key", ".config/fx-cloud/team-chosen"]
 
 
 def sandbox_named(name):
     p = subprocess.run(vercel("list", "--all", "--name-prefix", name), capture_output=True, text=True)
-    return p.returncode == 0 and any(r[0] == name for r in parse_sandbox_rows(p.stdout))
+    return p.returncode == 0 and any(l.split()[:1] == [name] for l in p.stdout.splitlines())
 
 
 def take_credentials(src, tmp):
@@ -932,10 +662,6 @@ def take_credentials(src, tmp):
     return tgz if rc == 0 else None
 
 
-def write_base(base):
-    write_json(BASE_FILE, base)
-
-
 def snapshot_base(name, t0, warm):
     """Snapshots the base sandbox NAME (this stops it) and makes the snapshot the new base."""
     say("taking the base snapshot; this stops the base sandbox")
@@ -944,142 +670,63 @@ def snapshot_base(name, t0, warm):
     if p.returncode != 0 or not m:
         sys.stderr.write((p.stdout + p.stderr)[-2000:])
         die("the snapshot failed; new agent sandboxes still use the old base")
-    cur = read_base() or {}
-    same = cur.get("sandbox") == name
-    old_bases = list(cur.get("old_bases", []))
-    retired = list(cur.get("retired", []))
-    if cur and not same:
-        old_bases.append(cur["sandbox"])  # cmd_base removes it next
-        retired += cur.get("snapshots") or [cur["snapshot"]]
-    write_base({"snapshot": m.group(0), "created": time.time(), "sandbox": name, "warm": warm,
-                "team": CFG["team"], "project": CFG["project"], "prefix": CFG["prefix"],
-                "snapshots": (cur.get("snapshots", []) if same else []) + [m.group(0)],
-                "old_bases": old_bases, "retired": retired})
+    os.makedirs(os.path.dirname(BASE_FILE), exist_ok=True)
+    with open(BASE_FILE + ".tmp", "w") as f:
+        json.dump({"snapshot": m.group(0), "created": time.time(), "sandbox": name, "warm": warm}, f, indent=1)
+    os.replace(BASE_FILE + ".tmp", BASE_FILE)
     say("base snapshot %s is ready after %.0f s; new agent sandboxes start from it" % (m.group(0), time.time() - t0))
 
 
-def snapshot_status(snap):
-    """The STATUS of snapshot SNAP (created, deleted, ...), "gone" when the API does not know it,
-    or None when the CLI fails otherwise."""
-    q = subprocess.run(vercel(("snapshots", "get"), snap), capture_output=True, text=True)
-    for line in q.stdout.splitlines():
-        w = line.split()
-        if len(w) >= 2 and w[0] == snap:
-            return w[1]
-    text = (q.stdout + q.stderr).lower()
-    return "gone" if "not found" in text or "404" in text else None
-
-
-def delete_snapshot(snap):
-    """Deletes snapshot SNAP. True when it is gone."""
-    p = subprocess.run(vercel(("snapshots", "delete"), snap), capture_output=True, text=True)
-    return p.returncode == 0 or snapshot_status(snap) in ("deleted", "gone")
-
-
-def clean_old_bases(agents, quiet=False):
-    """Removes old base sandboxes, and the snapshots of old bases that no agent sandbox of this
-    prefix still uses. AGENTS is name -> (status, snapshot)."""
-    with file_lock(os.path.join(STATE_DIR, "base.lock"), wait=False) as held:
-        if not held:
-            return  # a base build runs; it changes base.json
-        base = read_base()
-        if not base or not (base.get("old_bases") or base.get("retired")):
-            return
-        used = {snap for _, snap in agents.values() if snap}
-        old_bases = []
-        for n in base.get("old_bases", []):
-            if not is_base_name(n) or n == base["sandbox"]:
-                continue
-            p = subprocess.run(vercel("rm", "--delete-orphan-snapshots", n), capture_output=True, text=True)
-            if p.returncode != 0 and "not found" not in (p.stdout + p.stderr).lower():
-                old_bases.append(n)
-            elif not quiet:
-                say("removed the old base sandbox %s" % n)
-        retired = [s for s in base.get("retired", []) if s in used or not delete_snapshot(s)]
-        base["old_bases"], base["retired"] = old_bases, retired
-        write_base(base)
-
-
-# The CPU models that agent sandboxes land on (cascadelake, skylake_avx512 and icelake_server in
-# Nov 2026). Zig compiles a project's build.zig into native programs before every build, so a
-# seed holds them for each model.
+# The CPU models that agent sandboxes land on (11 probes in Nov 2026: cascadelake 5,
+# skylake_avx512 4, icelake_server 2). Zig compiles fx's build.zig into two native programs before
+# every build (the configurer and the maker), so the seed holds them for each model.
 SEED_CPUS = [c for c in os.environ.get("FXC_SEED_CPUS", "cascadelake,skylake_avx512,icelake_server").split(",") if c]
 MAX_PROBES = 12
 
-# Runs in a probe sandbox: for each Zig cache seed, check out its commit with the seed as its
-# .zig-cache, run its cpu_seed command (a cross build, or `zig build --help`), and pack the cache
-# files that this CPU model added.
 CPU_SEED_SCRIPT = r'''set -e
-seeds="$HOME/.cache/fxc-zig-seed"; out=/tmp/fxc-cpu
-rm -rf "$out" /tmp/fxc-cpu-local.tgz /tmp/fxc-cpu-global.tgz; mkdir -p "$out/local" "$HOME/.cache/zig"
-touch "$out/mark" && sleep 1
-start=$SECONDS; nlocal=0
-meta_get() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$1" "$2"; }
-for meta in "$seeds"/*/meta.json; do
-  [ -f "$meta" ] || continue
-  name="$(basename "$(dirname "$meta")")"
-  w="$out/w-$name"
-  git -C "$(meta_get "$meta" repo)" worktree add -q --detach "$w" "$(meta_get "$meta" commit)"
-  cp -a --reflink=auto "$seeds/$name/cache" "$w/.zig-cache" && mkdir -p "$w/.zig-cache/tmp"
-  cmd="$(meta_get "$meta" cpu_seed)"
-  (cd "$w" && bash -lc "${cmd:-zig build --help}" >/dev/null)
-  (cd "$w/.zig-cache" && find h o z -newer "$out/mark" -type f 2>/dev/null > "$out/l-$name.txt" || true
-   tar -czf "$out/local/$name.tgz" -T "$out/l-$name.txt")
-  nlocal=$((nlocal + $(wc -l < "$out/l-$name.txt")))
-done
-(cd "$HOME/.cache/zig" && find . -newer "$out/mark" -type f ! -path "./tmp/*" > "$out/g.txt"
- tar -czf /tmp/fxc-cpu-global.tgz -T "$out/g.txt")
-tar -czf /tmp/fxc-cpu-local.tgz -C "$out/local" .
-echo "FXC_CPU_SEED $((SECONDS - start)) $nlocal $(wc -l < "$out/g.txt") $(du -cm /tmp/fxc-cpu-*.tgz | tail -1 | cut -f1)"
+seed="$HOME/.cache/fxc-zig-seed/fx"; w=/tmp/fxc-cpu
+commit="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["commit"])' "$seed/meta.json")"
+git -C %(ws)s/fx worktree add -q --detach "$w" "$commit"
+cp -a --reflink=auto "$seed/cache" "$w/.zig-cache" && mkdir -p "$w/.zig-cache/tmp"
+touch /tmp/fxc-cpu-mark && sleep 1
+start=$SECONDS
+(cd "$w" && zig build -Dtarget=aarch64-macos --prefix zig-out/.fx-cloud-aarch64-macos >/dev/null)
+(cd "$w/.zig-cache" && find h o z -newer /tmp/fxc-cpu-mark -type f 2>/dev/null > /tmp/fxc-l.txt || true
+ tar -czf /tmp/fxc-cpu-local.tgz -T /tmp/fxc-l.txt)
+(cd "$HOME/.cache/zig" && find . -newer /tmp/fxc-cpu-mark -type f ! -path "./tmp/*" > /tmp/fxc-g.txt
+ tar -czf /tmp/fxc-cpu-global.tgz -T /tmp/fxc-g.txt)
+echo "FXC_CPU_SEED $((SECONDS - start)) $(wc -l < /tmp/fxc-l.txt) $(wc -l < /tmp/fxc-g.txt) $(du -cm /tmp/fxc-cpu-*.tgz | tail -1 | cut -f1)"
 '''
 
-# Runs in the base sandbox: add the probes' files to each seed and to the global Zig cache.
 CPU_MERGE_SCRIPT = r'''set -e
-seeds="$HOME/.cache/fxc-zig-seed"
-mkdir -p "$HOME/.cache/zig"
-for f in /tmp/fxc-cpu-*-local.tgz; do
-  d="$(mktemp -d)"; tar -xzf "$f" -C "$d"
-  for t in "$d"/*.tgz; do
-    n="$(basename "$t" .tgz)"
-    if [ -d "$seeds/$n/cache" ]; then tar -xzf "$t" --skip-old-files -C "$seeds/$n/cache"; fi
-  done
-  rm -rf "$d"
-done
+seed="$HOME/.cache/fxc-zig-seed/fx"
+for f in /tmp/fxc-cpu-*-local.tgz; do tar -xzf "$f" --skip-old-files -C "$seed/cache"; done
 for f in /tmp/fxc-cpu-*-global.tgz; do tar -xzf "$f" --skip-old-files -C "$HOME/.cache/zig"; done
 rm -f /tmp/fxc-cpu-*.tgz
-python3 - %(cpus)s <<'EOF'
-import glob, json, os, sys
-found = set()
-for path in glob.glob(os.path.expanduser("~/.cache/fxc-zig-seed/*/meta.json")):
-    meta = json.load(open(path))
-    meta["cpus"] = sorted(set(meta.get("cpus", [])) | set(sys.argv[1:]))
-    json.dump(meta, open(path, "w"))
-    found |= set(meta["cpus"])
-print("FXC_SEED_CPUS", " ".join(sorted(found)))
+python3 - "$seed/meta.json" %(cpus)s <<'EOF'
+import json, sys
+meta = json.load(open(sys.argv[1]))
+meta["cpus"] = sorted(set(meta.get("cpus", [])) | set(sys.argv[2:]))
+json.dump(meta, open(sys.argv[1], "w"))
+print("FXC_SEED_CPUS", " ".join(meta["cpus"]))
 EOF
 '''
 
 
-def seed_facts(name):
-    """(number of Zig cache seeds, the CPU model that Zig sees as native) in sandbox NAME."""
+def sandbox_cpu(name):
+    """The CPU model that Zig sees as native in sandbox NAME."""
     p = subprocess.run(vercel("exec", name, "--", "bash", "-lc",
-                              "echo FXC_SEEDS $(ls $HOME/.cache/fxc-zig-seed/*/meta.json 2>/dev/null | wc -l); "
                               "cd /tmp && zig build-exe --show-builtin 2>/dev/null | grep -m1 -o 'cpu\\.[a-z0-9_]*'"),
                        capture_output=True, text=True)
-    seeds = re.search(r"FXC_SEEDS (\d+)", p.stdout)
-    cpu = re.search(r"cpu\.([a-z0-9_]+)", p.stdout)
-    return (int(seeds.group(1)) if seeds else 0), (cpu.group(1) if cpu else None)
-
-
-def sandbox_cpu(name):
-    return seed_facts(name)[1]
+    m = re.search(r"cpu\.([a-z0-9_]+)", p.stdout)
+    return m.group(1) if m else None
 
 
 def add_cpu_seeds(name, base_cpu, t0, warm):
-    """Adds the native build programs of the other CPU models in SEED_CPUS to the seeds of base
+    """Adds the native build programs of the other CPU models in SEED_CPUS to the seed of base
     sandbox NAME, and takes its snapshot again. Probe sandboxes from the new snapshot make them; a
-    model that no probe lands on costs an agent there a few minutes on its first build. Any failure
-    keeps the first snapshot as the base."""
+    model that no probe lands on costs an agent there about 2 minutes on its first build. Any
+    failure keeps the first snapshot as the base."""
     global SANDBOX
     want = [c for c in SEED_CPUS if c != base_cpu]
     if not want or not base_cpu:
@@ -1089,10 +736,9 @@ def add_cpu_seeds(name, base_cpu, t0, warm):
     found, made, lock = {}, [], threading.Lock()
 
     def probe(i):
-        n = "%sprobe-%s-%d" % (CFG["prefix"], stamp, i)
+        n = "fxc-probe-%s-%d" % (stamp, i)
         if subprocess.call(vercel("create", "--name", n, "--snapshot", snap, "--non-persistent",
-                                  "--vcpus", str(CFG["vcpus"]), "--timeout", "30m", "--tag", "fxc=probe",
-                                  "--silent"),
+                                  "--vcpus", AGENT_VCPUS, "--timeout", "30m", "--tag", "fxc=probe", "--silent"),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
             return
         with lock:
@@ -1113,7 +759,8 @@ def add_cpu_seeds(name, base_cpu, t0, warm):
 
     def build(cpu):
         n = found[cpu]
-        p = subprocess.run(vercel("exec", n, "--", "bash", "-lc", CPU_SEED_SCRIPT), capture_output=True, text=True)
+        p = subprocess.run(vercel("exec", n, "--", "bash", "-lc", CPU_SEED_SCRIPT % {"ws": shlex.quote(WS)}),
+                           capture_output=True, text=True)
         m = re.search(r"FXC_CPU_SEED (\d+) (\d+) (\d+) (\d+)", p.stdout)
         if p.returncode != 0 or not m:
             results[cpu] = "failed (exit %d): %s" % (p.returncode, (p.stdout + p.stderr).strip()[-300:])
@@ -1126,7 +773,7 @@ def add_cpu_seeds(name, base_cpu, t0, warm):
                 return
         results[cpu] = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
 
-    say("adding the Zig build programs for the CPU models %s to the seeds (the base has %s)"
+    say("adding the Zig build programs for the CPU models %s to the seed (the base has %s)"
         % (", ".join(want), base_cpu))
     with tempfile.TemporaryDirectory() as tmp:
         try:
@@ -1176,147 +823,113 @@ def add_cpu_seeds(name, base_cpu, t0, warm):
     if p.returncode != 0 or not m:
         return give_up("adding the files failed (exit %d): %s"
                        % (p.returncode, (p.stdout + p.stderr).strip()[-300:]))
-    say("the seeds now have the build programs for %s" % m.group(1))
+    say("the seed now has the build programs for %s" % m.group(1))
     snapshot_base(name, t0, warm)
-
-
-def describe_facts(facts):
-    parts = ["zig %s" % facts["zig"] if facts["zig"] else "no zig",
-             "bun %s" % facts["bun"] if facts["bun"] else "no bun"]
-    parts.append("fx%s" % (" (%s)" % facts["fx_channel"] if facts["fx_channel"] else "") if facts["fx"] else "no fx")
-    if facts["git_name"] or facts["git_email"]:
-        parts.append("git identity %s <%s>" % (facts["git_name"], facts["git_email"]))
-    return ", ".join(parts)
-
-
-def base_create_flags():
-    return ["--vcpus", str(CFG["vcpus"]), "--timeout", BASE_TIMEOUT,
-            "--snapshot-expiration", "none", "--keep-last-snapshots", "2", "--keep-last-snapshots-for", "none"]
 
 
 def cmd_base(args):
     """Builds a new base snapshot, which every new agent sandbox starts from. Each build uses a new
     sandbox, because a snapshot holds every disk block that a sandbox ever changed: a fresh one keeps
     it small, so agent sandboxes start in seconds. The build takes the sign-ins over from the old
-    base (or from --from SANDBOX), installs everything with setup.sh, cleans up and warms the caches
-    with base.sh, takes the snapshot, and then removes the old base sandbox."""
+    base (or from --from SANDBOX), installs everything with setup.sh, drops the signing key and old
+    work with base.sh, warms the caches, takes the snapshot, and then removes the old base sandbox."""
     global SANDBOX
-    flags, rest = take_flags(args, ("--no-warm", "--no-cpu-seeds", "--remove"), valued=("--from",))
-    if rest:
-        die("usage: fx-cloud base [--no-warm] [--no-cpu-seeds] [--from SANDBOX] | fx-cloud base --remove", 2)
-    if flags.get("--remove"):
-        return remove_base()
+    flags, _ = take_flags(args, ("--no-warm", "--no-cpu-seeds", "--quiet"), valued=("--from",))
     warm = not flags.get("--no-warm")
-    if CFG["setup_hook"] and not os.path.isfile(CFG["setup_hook"]):
-        die("setup_hook %s is not a file" % short(CFG["setup_hook"]))
     with file_lock(os.path.join(STATE_DIR, "base.lock"), wait=False) as held:
         if not held:
             say("a base build runs already")
             return 0
         old = read_base()
-        src = flags.get("--from") or (old["sandbox"] if old else None)
-        name = "%sbase-%s" % (CFG["prefix"], time.strftime("%Y%m%d-%H%M%S"))
+        src = flags.get("--from") or (old["sandbox"] if old else FALLBACK)
+        name = "%s-%s" % (BASE_NAME, time.strftime("%Y%m%d-%H%M%S"))
         t0 = time.time()
-        facts = mac_facts()
-        say("the base gets %s" % describe_facts(facts))
-        made = False
-        try:
-            with tempfile.TemporaryDirectory() as tmp:  # private to this user; removed with its files
-                creds = take_credentials(src, tmp) if src and sandbox_named(src) else None
-                say("sign-ins: %s" % ("taken over from %s" % src if creds else "none yet"))
-                say("making the base sandbox %s in %s/%s" % (name, CFG["team"], CFG["project"]))
-                SANDBOX = name
-                if subprocess.call(vercel("create", "--name", name, *base_create_flags(), "--tag", "fxc=base"),
-                                   stdout=subprocess.DEVNULL) != 0:
-                    die("could not make the base sandbox")
-                made = True
-                bundle = build_bundle(tmp, facts)
-                say("uploading the setup bundle (%.1f MB)" % (os.path.getsize(bundle) / 1e6))
-                for local, remote in ((bundle, "/tmp/fxc-bundle.tgz"), (creds, "/tmp/fxc-creds.tgz")):
-                    if local and subprocess.call(vercel("copy", local, "%s:%s" % (name, remote)),
-                                                 stdout=subprocess.DEVNULL) != 0:
-                        die("upload to the base sandbox failed")
-            script = ("rm -rf /tmp/fxc && tar -xzf /tmp/fxc-bundle.tgz -C /tmp "
-                      "&& { [ ! -f /tmp/fxc-creds.tgz ] || { (umask 077; cd ~ && tar -xzf /tmp/fxc-creds.tgz) "
-                      "&& rm -f /tmp/fxc-creds.tgz; }; } "
-                      "&& bash /tmp/fxc/remote/setup.sh /tmp/fxc "
-                      "&& bash /tmp/fxc/remote/base.sh /tmp/fxc %s" % ("" if warm else "--no-warm"))
-            rc = subprocess.call(remote_cmd(script))
-            if rc != 0:
-                die("the base build failed (exit %d); new agent sandboxes still use the old base" % rc)
-            seeds, base_cpu = seed_facts(name) if warm and CFG["warm"] and facts["zig"] else (0, None)
-            snapshot_base(name, t0, warm)
-        except BaseException:
-            if made:
-                subprocess.run(vercel("rm", "--delete-orphan-snapshots", name), capture_output=True)
-                say("removed the unfinished base sandbox %s" % name)
-            raise
-        if seeds and not flags.get("--no-cpu-seeds"):
+        with tempfile.TemporaryDirectory() as tmp:  # private to this user; removed with its files
+            creds = take_credentials(src, tmp) if sandbox_named(src) else None
+            say("sign-ins: %s" % ("taken over from %s" % src if creds else "none; run `fx-cloud login` afterwards"))
+            say("making the base sandbox %s" % name)
+            SANDBOX = name
+            if subprocess.call(vercel("create", "--name", name, *CREATE_FLAGS, "--tag", "fxc=base"),
+                               stdout=subprocess.DEVNULL) != 0:
+                die("could not make the base sandbox")
+            bundle = build_bundle(tmp)
+            say("uploading the setup bundle (%.1f MB)" % (os.path.getsize(bundle) / 1e6))
+            for local, remote in ((bundle, "/tmp/fxc-bundle.tgz"), (creds, "/tmp/fxc-creds.tgz")):
+                if local and subprocess.call(vercel("copy", local, "%s:%s" % (name, remote)),
+                                             stdout=subprocess.DEVNULL) != 0:
+                    die("upload to the base sandbox failed")
+        script = ("rm -rf /tmp/fxc && tar -xzf /tmp/fxc-bundle.tgz -C /tmp "
+                  "&& { [ ! -f /tmp/fxc-creds.tgz ] || { (umask 077; cd ~ && tar -xzf /tmp/fxc-creds.tgz) "
+                  "&& rm -f /tmp/fxc-creds.tgz; }; } "
+                  "&& FXC_BASE=1 bash /tmp/fxc/remote/setup.sh /tmp/fxc --no-warm "
+                  "&& bash /tmp/fxc/remote/base.sh %s" % ("" if warm else "--no-warm"))
+        rc = subprocess.call(remote_cmd(script))
+        if rc != 0:
+            die("the base build failed (exit %d) in %s; new agent sandboxes still use the old base" % (rc, name))
+        base_cpu = sandbox_cpu(name) if warm else None
+        snapshot_base(name, t0, warm)
+        if warm and not flags.get("--no-cpu-seeds"):
             add_cpu_seeds(name, base_cpu, t0, warm)
-    agents = list_agents()
-    if agents is not None:
-        clean_old_bases(agents)
-    if not creds:
-        say("optional: `fx-cloud login` signs the base in to GitHub (for private repositories) and fx")
-    say("done: run `fx-cloud run <command>` from a project folder")
+        if old and old.get("sandbox") not in (None, name) and old["sandbox"] != FALLBACK:
+            # Its snapshot stays while an agent sandbox still uses it.
+            subprocess.run(vercel("rm", "--delete-orphan-snapshots", old["sandbox"]), capture_output=True)
+            say("removed the old base sandbox %s" % old["sandbox"])
+        if not creds:
+            say("this base has no sign-ins: run `fx-cloud login` to sign in to fx and GitHub and store the test key")
     return 0
 
 
-def remove_base():
-    """Removes the base sandbox and its snapshots. Agent sandboxes must be gone first."""
-    base = read_base()
-    if not base:
-        say("there is no base for %s/%s" % (CFG["team"], CFG["project"]))
-        return 0
-    agents = list_agents()
-    if agents is None:
-        die("cannot list the sandboxes; check `vercel login`")
-    if agents:
-        die("%d agent sandboxes still exist; remove them first with `fx-cloud gc --all`" % len(agents))
-    failed = False
-    for n in [base["sandbox"]] + base.get("old_bases", []):
-        if not is_base_name(n):
-            continue
-        p = subprocess.run(vercel("rm", "--delete-orphan-snapshots", n), capture_output=True, text=True)
-        if p.returncode != 0 and "not found" not in (p.stdout + p.stderr).lower():
-            failed = True
-            say("could not remove the base sandbox %s: %s" % (n, (p.stdout + p.stderr).strip()[-300:]))
-        else:
-            say("removed the base sandbox %s" % n)
-    for snap in dict.fromkeys(base.get("snapshots", []) + base.get("retired", []) + [base["snapshot"]]):
-        if not delete_snapshot(snap):
-            failed = True
-            say("could not delete the snapshot %s" % snap)
-    if failed:
-        return 1
-    os.unlink(BASE_FILE)
-    say("the base is gone; `fx-cloud base` makes a new one")
-    return 0
+def mac_team():
+    try:
+        out = subprocess.run(["fx", "status"], capture_output=True, text=True, timeout=20).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+    for line in out.splitlines():
+        if line.startswith("[status] team="):
+            return line.split("=", 1)[1].strip()
+    return ""
 
 
 def cmd_login(_args):
-    """Optional one-time sign-ins in the base sandbox. A new base snapshot keeps them for every
-    agent sandbox."""
+    """One-time sign-ins. Without FXC_SANDBOX they go into the base sandbox, and a new base
+    snapshot keeps them for every agent sandbox."""
     global SANDBOX
-    base = read_base()
-    if not base:
-        die("there is no base yet; run `fx-cloud base` first")
-    SANDBOX = base["sandbox"]
+    team = mac_team()
+    env = ["--env", "FXC_MAC_TEAM=" + team] if team else []
     t0 = time.time()
-    rc = interactive("bash ~/%s/login.sh" % SHARE_REL)
-    say("saving the sign-ins in a new base snapshot")
-    snapshot_base(SANDBOX, t0, base.get("warm", True))
+    if not LEGACY:
+        base = read_base()
+        if not base:
+            die("there is no base yet; run `fx-cloud base` first")
+        SANDBOX = base["sandbox"]
+        env += ["--env", "FXC_BASE=1"]
+    rc = interactive("bash ~/.local/share/fx-cloud/login.sh", extra_env=env)
+    if rc == 0 and not LEGACY:
+        say("saving the sign-ins in a new base snapshot")
+        snapshot_base(SANDBOX, t0, base.get("warm", True))
     return rc
+
+
+# --------------------------------------------------------------------------- open / attach
+
+# --------------------------------------------------------------------------- sync
+
+def local_build():
+    try:
+        d = json.loads(subprocess.run(["fx", "status", "--json"], capture_output=True, timeout=20).stdout)
+        return {"channel": d.get("build_channel"), "revision": d.get("build_revision")}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # --------------------------------------------------------------------------- worktree copies
 
 HANDOFF = (
-    "An agent on the user's Mac handed you this task with `fx-cloud agent`. You run in a Vercel "
-    "Sandbox, in a copy of a folder from the Mac at the same path. Work in this folder. Leave every "
-    "change uncommitted here: the Mac takes your changes back with `fx-cloud pull --patch`. Do not "
-    "commit, push, open pull requests, or change the git state of other folders. End with a short "
-    "report: what you changed, the commands you ran with their exit codes, and what is left.\n\nTask:\n"
+    "fx on the Mac handed you this task with `fx-cloud agent`. You run in a Vercel Sandbox, in a copy "
+    "of a Mac worktree at the same path. Work in this folder. Leave every change uncommitted here: the "
+    "Mac takes your changes back with `fx-cloud pull --patch`. Do not commit, push, open PRs, or change "
+    "the git state of other folders. End with a short report: what you changed, the commands you ran "
+    "with their exit codes, and what is left.\n\nTask:\n"
 )
 FIXED_IDENTITY = {
     "GIT_AUTHOR_NAME": "fx-cloud", "GIT_AUTHOR_EMAIL": "fx-cloud@localhost",
@@ -1342,7 +955,7 @@ def local_tree(top, gitdir, index, includes=()):
     tmp = os.path.join(gitdir, "fx-cloud-index.%d" % os.getpid())
     try:
         if os.path.exists(index):
-            shutil.copy2(index, tmp)  # keeps its time, so git still re-reads racily clean files
+            shutil.copyfile(index, tmp)
         env = dict(os.environ, GIT_INDEX_FILE=tmp)
         lgit(top, "add", "-A", "--", ".", *TLC_PATHSPECS, env=env)
         if includes:
@@ -1423,21 +1036,17 @@ def copy_info(st):
 
 
 def helper_script(op, *args):
-    return 'python3 "$HOME/%s/fxc-remote.py" %s %s %s' % (
-        SHARE_REL, op, PROTOCOL, " ".join(shlex.quote(a) for a in args))
+    return 'python3 "$HOME/.local/share/fx-cloud/fxc-remote.py" %s %s %s' % (
+        op, PROTOCOL, " ".join(shlex.quote(a) for a in args))
 
 
 def upload_helper():
     say("updating the sandbox helper")
-    tmp = "/tmp/fxc-remote-%s.py" % uuid.uuid4().hex[:12]
-    rc = subprocess.call(vercel("copy", os.path.join(HERE, "remote", "fxc-remote.py"), "%s:%s" % (SANDBOX, tmp)),
+    rc = subprocess.call(vercel("copy", os.path.join(HERE, "remote", "fxc-remote.py"),
+                                "%s:%s" % (SANDBOX, HELPER_REMOTE_PATH)),
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if rc == 0:
-        rc = subprocess.call(remote_cmd('install -D -m 755 %s "$HOME/%s/fxc-remote.py" && rm -f %s'
-                                        % (tmp, SHARE_REL, tmp)),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if rc != 0:
-        die("could not update the sandbox helper; `fx-cloud base` makes a new base with it")
+        die("could not update the sandbox helper; run fx-cloud setup --no-warm")
 
 
 def kill_remote(pidfile):
@@ -1491,6 +1100,9 @@ class Extender:
             os.makedirs(os.path.dirname(self.STATE), exist_ok=True)
             with open(self.STATE, "w") as f:
                 json.dump({"boot": boot, "added_s": added + EXTEND_BY_S}, f)
+            if LEGACY or SANDBOX == FALLBACK:
+                say("added %s to the sandbox session, which had less than %d minutes left"
+                    % (EXTEND_BY, EXTEND_WHEN_LEFT_S // 60))
         else:
             say("could not add time to the sandbox session; your plan may limit one session's length")
 
@@ -1510,18 +1122,33 @@ def remote_stream(script, capture=False, pidfile=None, _retry=True):
     p = subprocess.Popen(remote_cmd(script), stdout=subprocess.PIPE if capture else None,
                          stderr=subprocess.PIPE, start_new_session=True)
     results, before = [], []
-    started = [False]
+    started, old_doc = [False], [False]
+    spawned, exit_code, carry = [False], [None], [""]
 
     def pump():
         for raw in iter(p.stderr.readline, b""):
-            line = raw.decode("utf-8", "replace")
+            line = carry[0] + raw.decode("utf-8", "replace")
+            carry[0] = ""
+            if line.endswith(TICK):
+                carry[0] = line[:-len(TICK)]  # a partial line of the command, which the tick ended
+                continue
+            if old_doc[0]:
+                continue
+            if line.startswith("Sandbox half of `fx-cloud sync`"):
+                # The helper from the first setup prints this usage text for any op it lacks.
+                old_doc[0] = True
+                results.append({"error": "old_helper"})
+                continue
             if line.startswith("FXC::"):
                 try:
                     result = json.loads(line[5:])
                 except ValueError:
                     continue
                 if "uptime" in result:
+                    spawned[0] = True
                     EXTENDER.observe(result)  # the session clock, sent as a command starts
+                elif "exit" in result:
+                    exit_code[0] = result["exit"]
                 else:
                     results.append(result)
                 continue
@@ -1532,6 +1159,9 @@ def remote_stream(script, capture=False, pidfile=None, _retry=True):
                     before.append(line)
                 continue
             sys.stderr.write(line)
+            sys.stderr.flush()
+        if carry[0] and started[0]:
+            sys.stderr.write(carry[0])
             sys.stderr.flush()
 
     reader = threading.Thread(target=pump, daemon=True)
@@ -1569,17 +1199,23 @@ def remote_stream(script, capture=False, pidfile=None, _retry=True):
     EXTENDER.finish()
     if not started[0] and rc != 0 and not results:
         text = "".join(before)
-        if _retry and not stopped and is_agent_name(SANDBOX) and "not found for this project" in text:
+        if (_retry and not stopped and SANDBOX.startswith(AGENT_PREFIX)
+                and "not found for this project" in text):
             restart_sandbox()
             return remote_stream(script, capture=capture, pidfile=pidfile, _retry=False)
         sys.stderr.write(text)
     if stopped:
         rc = 128 + stopped[0]
+    elif spawned[0] and exit_code[0] is None:
+        # Never pass on the CLI's own code here: it has been 0 for a lost stream.
+        say("the connection to the sandbox closed before the command ended, so its later output "
+            "and its exit code are lost; the command may still be running in the sandbox")
+        rc = LOST_STREAM
     return rc, results, out
 
 
 def is_old_helper(rc, last):
-    return rc == OLD_HELPER and last.get("error") == "old_helper"
+    return rc in (2, OLD_HELPER) and last.get("error") == "old_helper"
 
 
 def helper_call(op, *args, capture=False):
@@ -1635,6 +1271,10 @@ def make_bundle(st, strategy, path):
         return True
     finally:
         lgit(st["top"], "update-ref", "-d", ref, check=False)
+
+
+INLINE_LIMIT = 48 * 1024
+PUSH_CACHE = os.path.join(HOME, ".cache", "fx-cloud", "pushed")
 
 
 def cache_path(st):
@@ -1710,11 +1350,12 @@ def run_plain(script, capture):
         return rc, out
 
 
-def run_checked(st, script, capture=False, force=False):
+def run_checked_and_ran(st, script, capture=False, force=False):
     """Runs SCRIPT in the sandbox copy of the worktree. When the copy may differ from the Mac, the
-    same sandbox call first makes it match, so a changed worktree usually costs one call."""
+    same sandbox call first makes it match, so a changed worktree usually costs one call. Returns
+    (rc, out, ran); ran is False when the sandbox did not start SCRIPT."""
     if st is None:
-        return run_plain(script, capture)
+        return run_plain(script, capture) + (True,)
     strategies = None
     copy = force or not cache_says_synced(st)
     helper_updated = False
@@ -1736,7 +1377,7 @@ def run_checked(st, script, capture=False, force=False):
                 if payload is None:
                     die("cannot send the commits to the sandbox")
                 bundle_arg, exclude_arg, cleanup, size = payload
-                say("copying %s to the sandbox (%s)" % (short(st["top"]), human(size)))
+                say("copying %s to the sandbox (%s)" % (st["top"], human(size)))
                 apply = helper_script("apply", st["top"], st["sha"], st["tree"], st["cwip"], st["inc_arg"],
                                       st["origin"], bundle_arg, exclude_arg, "1" if force else "0")
                 remote = "(" + apply + " && " + run + ")" + cleanup
@@ -1750,7 +1391,7 @@ def run_checked(st, script, capture=False, force=False):
         if changed:
             forget_synced(st)
             report_sandbox_changed(changed["sandbox_changed"])
-            return 1, out
+            return 1, out, False
         err = next((r for r in results if r.get("error")), None)
         if err and err["error"] == "prerequisite" and strategies and len(strategies) > 1:
             strategies.pop(0)  # the sandbox lacks commits the bundle builds on; send more history
@@ -1758,7 +1399,7 @@ def run_checked(st, script, capture=False, force=False):
         if err:
             forget_synced(st)
             say("sandbox: %s %s" % (err["error"], err.get("detail", "")))
-            return 1, out
+            return 1, out, False
         if rc == NEEDS_PUSH and last.get("needs_push"):
             if copy:
                 die("the sandbox copy still differs after copying; run with --force")
@@ -1768,15 +1409,24 @@ def run_checked(st, script, capture=False, force=False):
         if applied and not applied.get("tree_match", True):
             say("note: the sandbox copy differs from the Mac in ignored or special files")
         remember_synced(st)
-        return rc, out
+        return rc, out, True
     die("the sandbox copy did not settle after several tries")
+
+
+def run_checked(st, script, capture=False, force=False):
+    """Runs SCRIPT like run_checked_and_ran, and returns only (rc, out)."""
+    rc, out, _ = run_checked_and_ran(st, script, capture=capture, force=force)
+    return rc, out
+
+
+PLAIN_CACHE = os.path.join(HOME, ".cache", "fx-cloud", "plain")
 
 
 def plain_state(path):
     """A folder that is not a git worktree: its files (without build folders), their hashes, and
     one digest of all of them. Hashes are reused while a file's size and time stay the same."""
     root = os.path.realpath(path)
-    refused = {"/", HOME, os.path.dirname(HOME), "/tmp", "/private", "/private/tmp", "/var",
+    refused = {"/", HOME, os.path.dirname(HOME), "/Users", "/tmp", "/private", "/private/tmp", "/var",
                "/private/var", os.path.realpath(tempfile.gettempdir())}
     if root in refused:
         die("will not copy %s to the sandbox; run fx-cloud from a project folder" % root)
@@ -1866,7 +1516,7 @@ def run_checked_plain(ps, script, capture=False, force=False):
                             die("upload to the sandbox failed")
                         cleanup = "; rc=$?; rm -f %s; exit $rc" % tar_arg
                 say("copying %d changed file(s) of %s to the sandbox, one way (not a git worktree)"
-                    % (len(changed), short(ps["root"])))
+                    % (len(changed), ps["root"]))
                 apply = helper_script("applyplain", ps["root"], ps["digest"],
                                       "-" if full else sent.get("digest", "-"), tar_arg, encode_list(deleted))
                 remote = "(" + apply + " && " + run + ")" + cleanup
@@ -1941,6 +1591,17 @@ def run_here(script, flags, capture=False):
     return run_checked_plain(ps, script, capture=capture, force=force)
 
 
+def run_here_and_ran(script):
+    """Runs SCRIPT the way run_here(script, {}) does, and also says whether the sandbox started it.
+    A plain folder always counts as started."""
+    st = local_state(os.getcwd(), [])
+    if st is None:
+        rc, out = run_here(script, {})
+        return rc, out, True
+    use_sandbox(st["top"])
+    return run_checked_and_ran(st, script)
+
+
 def cmd_run(args):
     flags, rest = take_flags(args, ("--no-push", "--force"), multi=("--include",))
     if not rest:
@@ -1954,34 +1615,25 @@ def cmd_push(args):
     flags, _ = take_flags(args, ("--force",), multi=("--include",))
     rc, _ = run_here("true", flags)
     if rc == 0:
-        say("the sandbox copy of %s matches the Mac" % short(os.path.realpath(os.getcwd())))
+        say("the sandbox copy of %s matches the Mac" % os.path.realpath(os.getcwd()))
     return rc
 
 
 def build_out(target):
     """The sandbox folder that a build for TARGET installs to before the copy to the Mac. It is
-    the same every time: a project's build.zig may put the install folder into the options its
-    modules import (fx does), so a new folder would make Zig compile everything again."""
+    the same every time: fx's build.zig puts the install folder in the test_paths options that the
+    fx module imports, so a new folder would make Zig compile fx again. remote/base.sh warms the
+    macOS one."""
     return "zig-out/.fx-cloud-" + re.sub(r"[^A-Za-z0-9_.-]", "_", target)
 
 
-def zig_arch():
-    machine = platform.machine().lower()
-    return {"arm64": "aarch64", "aarch64": "aarch64", "amd64": "x86_64", "x86_64": "x86_64"}.get(machine, machine)
-
-
 def mac_target():
-    return "%s-macos" % ("aarch64" if zig_arch() == "aarch64" else "x86_64")
-
-
-def host_target():
-    """The Zig target of this computer, for builds that come back here."""
-    return mac_target() if sys.platform == "darwin" else "%s-linux" % zig_arch()
+    return "%s-macos" % ("aarch64" if platform.machine() == "arm64" else "x86_64")
 
 
 def cmd_macos_build(args):
-    """Builds the macOS binary of a Zig project in the sandbox, and puts it in the Mac worktree's
-    zig-out/bin. The sandbox's own zig-out/bin keeps its Linux binary."""
+    """Builds the macOS binary of a Zig project, such as fx, in the sandbox, and puts it in the
+    Mac worktree's zig-out/bin. The sandbox's own zig-out/bin keeps its Linux binary."""
     st = local_state(os.getcwd())
     if st is None:
         die("run fx-cloud macos-build from inside a git worktree of a Zig project")
@@ -2004,28 +1656,31 @@ def cmd_macos_build(args):
             die("download failed")
         count = extract_plain(tgz, os.path.join(st["top"], "zig-out"))
     say("the macOS build from the sandbox is in %s/zig-out/bin (%d %s)"
-        % (short(st["top"]), count, "file" if count == 1 else "files"))
+        % (st["top"], count, "file" if count == 1 else "files"))
     return 0
 
 
 def cmd_agent(args):
-    flags, rest = take_flags(args, ("--no-push", "--force"), valued=("--resume",), multi=("--include",))
+    flags, rest = take_flags(args, ("--test-lane", "--no-push", "--force"), valued=("--resume",),
+                             multi=("--include",))
     if not rest:
-        die('usage: fx-cloud agent [--resume ID] [--include PATH]... "<task>"', 2)
+        die('usage: fx-cloud agent [--resume ID] [--test-lane] [--include PATH]... "<task>"', 2)
     task = " ".join(rest)
-    cmd = list(CFG["agent_command"]) + ["ask", "--json"]
+    fx = ["fx", "ask", "--json"]
     if flags.get("--resume"):
-        cmd += ["--resume", flags["--resume"], task]
+        fx += ["--resume", flags["--resume"], task]
     else:
-        cmd += [HANDOFF + task]
+        fx += [HANDOFF + task]
+    if flags.get("--test-lane"):
+        fx = ["aig", "test", "--fx-home"] + fx
     st = None if flags.get("--no-push") else local_state(os.getcwd(), flags.get("--include", []))
-    say("handing the task to %s in the sandbox; its progress follows" % CFG["agent_command"][0])
-    rc, out = run_here(shlex.join(cmd), flags, capture=True)
+    say("handing the task to fx in the sandbox; its progress follows")
+    rc, out = run_here(shlex.join(fx), flags, capture=True)
     try:
         result = json.loads(out.decode("utf-8", "replace"))
     except ValueError:
         sys.stdout.write(out.decode("utf-8", "replace"))
-        say("the agent in the sandbox returned no JSON result (exit %d)" % rc)
+        say("fx in the sandbox returned no JSON result (exit %d)" % rc)
         return rc or 1
     print((result.get("final_output") or result.get("output") or "").rstrip())
     print()
@@ -2044,7 +1699,7 @@ def cmd_agent(args):
     elif not flags.get("--no-push"):
         print("this folder is not a git worktree, so its sandbox copy is one way; "
               "bring files back with `fx-cloud pull <path>`")
-    if sid:
+    if sid and not flags.get("--test-lane"):
         print("continue it with: fx-cloud agent --resume %s \"<next step>\"" % sid)
     return rc
 
@@ -2053,8 +1708,8 @@ def cmd_pull(args):
     flags, rest = take_flags(args, ("--patch", "--apply"))
     st = local_state(os.getcwd())
     root = st["top"] if st else os.path.realpath(os.getcwd())
-    if use_sandbox(root, create=False) is None:
-        die("this agent has no sandbox for %s, so there is nothing to pull" % short(root))
+    if use_sandbox(root, create=False) is None and not (LEGACY or SANDBOX == FALLBACK):
+        die("this agent has no sandbox for %s, so there is nothing to pull" % root)
     if flags.get("--patch"):
         if st is None:
             die("run fx-cloud pull --patch from inside a git worktree")
@@ -2076,7 +1731,7 @@ def cmd_pull(args):
             die("the patch does not apply to the Mac worktree; nothing changed. "
                 "See it with `fx-cloud pull --patch`.")
         lgit(st["top"], "apply", "--binary", "-", data=patch)
-        say("applied the sandbox changes to %s:" % short(st["top"]))
+        say("applied the sandbox changes to %s:" % st["top"])
         for line in files:
             print("  " + line.replace("\t", " "))
         return 0
@@ -2101,11 +1756,12 @@ def cmd_pull(args):
 
 # --------------------------------------------------------------------------- zig and bun shims
 #
-# shims/zig and shims/bun come before the real tools in PATH (install.sh --shims) and call
+# shims/zig and shims/bun come before the real tools in PATH on the Mac and call
 # `fx-cloud zig|bun --real <path> -- <args>`. Heavy builds and tests run in the agent's sandbox;
-# everything else, every command in a `local_only` project, and every command with FXC_LOCAL=1
-# runs the real tool here.
+# everything else, and every command with FXC_LOCAL=1, runs the real tool on the Mac.
 
+# Repositories that link AppKit or use Swift build on the Mac. A name matches the origin URL.
+LOCAL_ONLY_REPOS = ("fxd-zig", "fx-desktop", "fx-browser")
 # zig build options that take their value as the next word.
 ZIG_VALUE_OPTS = {"-p", "--prefix", "--prefix-lib-dir", "--prefix-exe-dir", "--prefix-include-dir",
                   "--sysroot", "--search-prefix", "--libc", "--build-file", "--cache-dir",
@@ -2135,23 +1791,18 @@ def zig_build_parts(args):
     return steps, prefix, target
 
 
-def local_only_match(root, origin, names):
-    """True when a `local_only` name is part of the origin URL, or starts a folder name in ROOT."""
-    return any(name in origin or ("/" + name) in root for name in names if name)
-
-
 def project_allows_remote(path):
-    """False for folders fx-cloud must not copy and for `local_only` projects."""
+    """False for folders fx-cloud must not copy and for repositories that build only on the Mac."""
     root = folder_root(path)
     if root in ("/", HOME, "/tmp", "/private/tmp") or root.startswith("/System"):
         return False
     origin = subprocess.run(["git", "-C", path, "config", "--get", "remote.origin.url"],
-                            capture_output=True, text=True).stdout.strip()
-    return not local_only_match(root, origin, CFG["local_only"])
+                            capture_output=True, text=True).stdout
+    return not any(name in origin or ("/" + name) in root for name in LOCAL_ONLY_REPOS)
 
 
 def zig_route(args):
-    """local, remote-install (build for this computer there and copy it here), or remote-run."""
+    """local, remote-install (build the macOS binary there and copy it here), or remote-run."""
     if not args or args[0] not in ("build", "test"):
         return "local"
     if args[0] == "test":
@@ -2177,6 +1828,324 @@ def bun_route(args):
     return "local"
 
 
+# The interpreters' own options that may come before the script; anything else (such as -c) means
+# that no TLA+ runner script is given, so the call runs on the Mac.
+TLA_OPTS = {
+    "sh": {"-e", "-x", "-u", "-v", "-eu", "-ue", "-ex", "-xe", "-eux", "-xeu"},
+    "bash": {"-e", "-x", "-u", "-v", "-eu", "-ue", "-ex", "-xe", "-eux", "-xeu"},
+    "python3": {"-u", "-B", "-E", "-s", "-S", "-O"},
+}
+
+
+def git_toplevel(path):
+    p = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return os.path.realpath(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip() else None
+
+
+def tla_route(tool, args):
+    """remote-run when TOOL runs a script under tests/tla/ of the current git worktree, such as
+    fx's TLA+ check.sh scripts and tests/tla/mcp/run.py; else local."""
+    i = 0
+    while i < len(args) and args[i] in TLA_OPTS.get(tool, ()):
+        i += 1
+    if i >= len(args) or args[i].startswith("-"):
+        return "local"
+    script = args[i]
+    if not script.endswith(".py" if tool == "python3" else ".sh") or not os.path.isfile(script):
+        return "local"
+    top = git_toplevel(os.getcwd())
+    if not top:
+        return "local"
+    rel = os.path.relpath(os.path.realpath(script), top)
+    return "remote-run" if rel.startswith("tests/tla/") else "local"
+
+
+# The run folder has the same path in the sandbox and on the Mac, so the paths that TLC prints work there.
+LOGS_ROOT_FORMAT = "/tmp/fxc-tla-%d"
+RUN_ID_CHARS = 8
+SKIPPED_MANIFEST = ".fxc-skipped"  # must equal the one in remote/fxc-remote.py
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+BYTES_PER_KILOBYTE = 1024
+BYTES_PER_MEGABYTE = 1024 * BYTES_PER_KILOBYTE
+MAX_LOG_FILE_BYTES = 20 * BYTES_PER_MEGABYTE  # must equal LOG_FILE_LIMIT_BYTES in remote/fxc-remote.py
+MAX_LOG_TOTAL_BYTES = 50 * BYTES_PER_MEGABYTE  # must equal LOG_TOTAL_LIMIT_BYTES in remote/fxc-remote.py
+STALE_DOWNLOAD_SECONDS = 600  # a run killed mid-copy leaves its logs-*.tgz behind
+COPY_TIMEOUT_SECONDS = 300  # the copy is at most 50 MB
+REASON_MAX_CHARACTERS = 200
+
+
+def run_dir_path(uid, run_id):
+    return LOGS_ROOT_FORMAT % uid + "/" + run_id
+
+
+def remote_script(command, run_dir, pack_command):
+    return ('d=%s; if mkdir -p "$d"; then export TMPDIR="$d"; else echo "fx-cloud: could not make $d, so the logs of this run stay in the sandbox" >&2; fi; %s; rc=$?; { %s; } >/dev/null 2>&1; exit $rc'
+            % (shlex.quote(run_dir), command, pack_command))
+
+
+def prepare_logs_parent(path, uid):
+    try:
+        os.makedirs(path, mode=PRIVATE_DIR_MODE, exist_ok=True)
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+        return False
+    try:
+        os.chmod(path, PRIVATE_DIR_MODE)
+    except OSError:
+        return False
+    return True
+
+
+def is_inside(root, target):
+    return target == root or target.startswith(root + os.sep)
+
+
+def is_skipped_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    path, size = entry.get("path"), entry.get("bytes")
+    return isinstance(path, str) and isinstance(size, int) and not isinstance(size, bool)
+
+
+def read_manifest(source):
+    try:
+        entries = json.loads(source.read().decode("utf-8"))
+    except ValueError:
+        return []
+    if not isinstance(entries, list):
+        return []
+    return [(entry["path"], entry["bytes"]) for entry in entries if is_skipped_entry(entry)]
+
+
+def write_log(source, target):
+    os.makedirs(os.path.dirname(target), mode=PRIVATE_DIR_MODE, exist_ok=True)
+    with open(target, "wb") as out:
+        shutil.copyfileobj(source, out)
+    os.chmod(target, PRIVATE_FILE_MODE)
+
+
+def member_target(root, member):
+    """The real path where MEMBER would be written under ROOT, or None when it leaves ROOT."""
+    target = os.path.realpath(os.path.join(root, member.name))
+    return target if is_inside(root, target) else None
+
+
+def fits_limits(size, written_bytes):
+    return size <= MAX_LOG_FILE_BYTES and written_bytes + size <= MAX_LOG_TOTAL_BYTES
+
+
+def extract_folder(root, member):
+    target = member_target(root, member)
+    if target is not None:
+        os.makedirs(target, mode=PRIVATE_DIR_MODE, exist_ok=True)
+
+
+def extract_log(tar, member, root, written_bytes):
+    """Writes a regular file under ROOT when it fits the limits. Returns True when it was written."""
+    target = member_target(root, member)
+    if target is None or not member.isreg() or not fits_limits(member.size, written_bytes):
+        return False
+    with tar.extractfile(member) as source:
+        write_log(source, target)
+    return True
+
+
+def extract_logs(tgz, dest):
+    count, refused, written_bytes, skipped = 0, 0, 0, []
+    try:
+        os.makedirs(dest, mode=PRIVATE_DIR_MODE, exist_ok=True)
+        root = os.path.realpath(dest)
+        with tarfile.open(tgz, "r:gz") as tar:
+            for member in tar:
+                if member.name == SKIPPED_MANIFEST and member.isreg():
+                    skipped = read_manifest(tar.extractfile(member))
+                elif member.isdir():
+                    extract_folder(root, member)
+                elif extract_log(tar, member, root, written_bytes):
+                    count += 1
+                    written_bytes += member.size
+                else:
+                    refused += 1
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as e:
+        return count, skipped, refused, printable(str(e) or type(e).__name__)
+    return count, skipped, refused, None
+
+
+def printable(text):
+    return "".join(ch if ch.isprintable() else escape_char(ch) for ch in text)
+
+
+def escape_char(ch):
+    code = ord(ch)
+    return "\\x%02x" % code if code < 256 else "\\u%04x" % code
+
+
+def char_bytes(ch):
+    # A file name that is not UTF-8 holds its bytes as surrogates U+DC80..U+DCFF; other surrogates have no byte form.
+    try:
+        return ch.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return ch.encode("utf-8", "surrogatepass")
+
+
+def shell_escape_char(ch):
+    if ch == "\\":
+        return "\\\\"
+    if ch == "'":
+        return "\\'"
+    if ch.isprintable():
+        return ch
+    return "".join("\\x%02x" % byte for byte in char_bytes(ch))
+
+
+def shell_quote_printable(text):
+    if text.isprintable():
+        return shlex.quote(text)
+    return "$'" + "".join(shell_escape_char(ch) for ch in text) + "'"
+
+
+def human_size(byte_count):
+    if byte_count >= BYTES_PER_MEGABYTE:
+        # Rounds up, so a file over a limit never prints as the limit.
+        tenths = -(-byte_count * 10 // BYTES_PER_MEGABYTE)
+        return "%d.%d MB" % divmod(tenths, 10)
+    if byte_count >= BYTES_PER_KILOBYTE:
+        return "%d KB" % max(1, byte_count // BYTES_PER_KILOBYTE)
+    return "%d bytes" % byte_count
+
+
+def skipped_note(path_and_bytes, run_dir):
+    relpath, byte_count = path_and_bytes
+    full = run_dir + "/" + relpath
+    if byte_count > MAX_LOG_FILE_BYTES:
+        reason = "is too large to copy back (%s; the limit is %d MB for one file)" % (
+            human_size(byte_count), MAX_LOG_FILE_BYTES // BYTES_PER_MEGABYTE)
+    else:
+        reason = "did not fit in the copy (%s; the limit is %d MB for all logs of one run)" % (
+            human_size(byte_count), MAX_LOG_TOTAL_BYTES // BYTES_PER_MEGABYTE)
+    return "%s %s; get it with: fx-cloud pull %s <dest>" % (printable(full), reason, shell_quote_printable(full))
+
+
+def refused_note(refused, run_dir):
+    return "left out %d %s from the sandbox that %s not plain log files under %s" % (
+        refused, "entry" if refused == 1 else "entries", "was" if refused == 1 else "were", run_dir)
+
+
+def log_notes(count, skipped, refused, run_dir):
+    notes = []
+    if count > 0:
+        notes.append("copied %d TLC log %s to %s" % (count, "file" if count == 1 else "files", run_dir))
+    notes.extend(skipped_note(entry, run_dir) for entry in skipped)
+    if refused > 0:
+        notes.append(refused_note(refused, run_dir))
+    return notes
+
+
+def remove_quietly(path):
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
+def failure_reason(stderr, returncode):
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if not lines:
+        return "exit %d" % returncode
+    return printable(lines[-1])[:REASON_MAX_CHARACTERS]
+
+
+def fetch_logs(run_dir, tgz):
+    """Copies the run's tarball from the sandbox to TGZ. Returns (ok, reason); reason is "" when ok."""
+    try:
+        done = subprocess.run(vercel("copy", "%s:%s.tgz" % (SANDBOX, run_dir), tgz),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                              timeout=COPY_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return False, "the copy took longer than %d s" % COPY_TIMEOUT_SECONDS
+    except OSError as e:
+        return False, printable(str(e) or type(e).__name__)
+    if done.returncode == 0:
+        return True, ""
+    return False, failure_reason(done.stderr, done.returncode)
+
+
+def stale_downloads(entries, now):
+    return [name for name, mtime in entries
+            if name.startswith("logs-") and name.endswith(".tgz") and now - mtime > STALE_DOWNLOAD_SECONDS]
+
+
+def remove_stale_downloads(parent):
+    entries = []
+    with contextlib.suppress(OSError):
+        with os.scandir(parent) as listing:
+            for entry in listing:
+                if entry.is_file(follow_symlinks=False):
+                    entries.append((entry.name, entry.stat(follow_symlinks=False).st_mtime))
+    for name in stale_downloads(entries, time.time()):
+        remove_quietly(os.path.join(parent, name))
+
+
+def bring_logs_back(run_dir, uid):
+    if not SANDBOX:
+        return
+    parent = os.path.dirname(run_dir)
+    if not prepare_logs_parent(parent, uid):
+        say("not copying the TLC logs back: %s is not a private folder of yours" % parent)
+        return
+    remove_stale_downloads(parent)
+    try:
+        fd, tgz = tempfile.mkstemp(prefix="logs-", suffix=".tgz", dir=parent)
+        os.close(fd)
+    except OSError as e:
+        say("could not copy the TLC logs back: %s" % e)
+        return
+    try:
+        ok, reason = fetch_logs(run_dir, tgz)
+        if not ok:
+            say("could not copy the TLC logs back from the sandbox: %s; get them with: fx-cloud pull %s ." % (
+                reason, shell_quote_printable(run_dir + ".tgz")))
+            return
+        count, skipped, refused, error = extract_logs(tgz, run_dir)
+    finally:
+        remove_quietly(tgz)
+    if error:
+        say("could not unpack the TLC logs: %s" % error)
+    for note in log_notes(count, skipped, refused, run_dir):
+        say(note)
+
+
+def cmd_tla(args):
+    """The sh, bash and python3 shims call this only for a call that looks like a TLA+ runner."""
+    flags, rest = take_flags(args, (), valued=("--real", "--tool"))
+    tool, real = flags.get("--tool", ""), flags.get("--real")
+    if tool not in TLA_OPTS or not real or not os.access(real, os.X_OK):
+        die("the shim found no real %s; set FXC_LOCAL=1 or check PATH" % (tool or "program"), 127)
+    route = tla_route(tool, rest)
+    if route != "local" and not project_allows_remote(os.getcwd()):
+        route = "local"
+    if os.environ.get("FXC_SHIM_DRYRUN"):
+        print("%s %s -> %s" % (tool, shlex.join(rest), route))
+        return 0
+    if route == "local":
+        os.execv(real, [real] + rest)  # the absolute path, so Python finds its own prefix
+    say("%s runs in this agent's sandbox: TLC runs there, not on this Mac" % shlex.join([tool] + rest[:2]))
+    uid = os.getuid()
+    run_dir = run_dir_path(uid, uuid.uuid4().hex[:RUN_ID_CHARS])
+    pack_command = helper_script("packlogs", run_dir, run_dir + ".tgz")
+    rc, _, ran = run_here_and_ran(remote_script(shlex.join([tool] + rest), run_dir, pack_command))
+    if not ran:
+        # The sandbox did not start the check and already said why, so no logs exist.
+        return rc
+    # The run's exit code must stay the check's own, so a broken copy-back only prints a note.
+    try:
+        bring_logs_back(run_dir, uid)
+    except Exception as e:
+        say("could not copy the TLC logs back: %s" % printable(str(e) or type(e).__name__))
+    return rc
+
+
 def shim_args(args):
     flags, rest = take_flags(args, (), valued=("--real",))
     real = flags.get("--real")
@@ -2199,16 +2168,15 @@ def cmd_zig(args):
         return 0
     if route == "local":
         shim_exec_local(real, "zig", rest)
-    need_config("zig")
     if route == "remote-run":
         rc, _ = run_here(shlex.join(["zig"] + rest), {})
         return rc
-    # remote-install: a local `zig build` leaves a binary for this computer in the prefix, so the
-    # sandbox builds for it (unless a target is given) and the result is copied back to the prefix.
+    # remote-install: a local `zig build` leaves a binary for this Mac in the prefix, so the sandbox
+    # builds for macOS (unless a target is given) and the result is copied back to the same prefix.
     build = rest[1:]
     steps, prefix, target = zig_build_parts(build)
     prefix = prefix or "zig-out"
-    out = build_out(target or host_target())
+    out = build_out(target or mac_target())
     keep = []
     i = 0
     while i < len(build):  # the user's prefix is where the copy goes; the build uses OUT
@@ -2219,9 +2187,9 @@ def cmd_zig(args):
             keep.append(build[i])
         i += 1
     if not target:
-        keep = ["-Dtarget=%s" % host_target()] + keep
+        keep = ["-Dtarget=%s" % mac_target()] + keep
     say("zig build runs in this agent's sandbox%s; the result comes back to %s"
-        % ("" if target else " for %s" % host_target(), prefix))
+        % ("" if target else " for macOS", prefix))
     rc, _ = run_here(shlex.join(["zig", "build", "--prefix", out] + keep), {})
     if rc != 0:
         return rc
@@ -2261,7 +2229,6 @@ def cmd_bun(args):
         return 0
     if route == "local":
         shim_exec_local(real, "bun", rest)
-    need_config("bun")
     # In the sandbox: build the project's Linux binary first when it is a Zig project, because
     # E2E tests and drivers run it; install the nearest package.json's dependencies when missing.
     script = (
@@ -2273,18 +2240,6 @@ def cmd_bun(args):
         'exec ' + shlex.join(["bun"] + rest))
     rc, _ = run_here(script, {})
     return rc
-
-
-def cmd_tla(args):
-    """The sh, bash and python3 shims in extras/fx/shims call this for TLA+ runner scripts. The
-    routing lives in extras/fx/tla.py."""
-    path = os.path.join(HERE, "extras", "fx", "tla.py")
-    if not os.path.isfile(path):
-        die("the tla command needs extras/fx/tla.py", 127)
-    spec = importlib.util.spec_from_file_location("fxc_tla", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.main(sys.modules[__name__], args)
 
 
 def extract_plain(tgz, dest):
@@ -2307,78 +2262,13 @@ def extract_plain(tgz, dest):
     return count
 
 
-# --------------------------------------------------------------------------- init and the rest
-
-def ask(question, default):
-    if not sys.stdin.isatty():
-        die("%s: not given; run `fx-cloud init --team TEAM --project PROJECT`" % question, 2)
-    try:
-        answer = input("%s%s: " % (question, " [%s]" % default if default else "")).strip()
-    except EOFError:
-        answer = ""
-    return answer or default or ""
-
-
-def cmd_init(args):
-    """Writes the settings file: the Vercel team and project, after a check that the Vercel CLI
-    can reach them."""
-    global CFG, CONFIG_FOUND
-    flags, rest = take_flags(args, (), valued=("--team", "--project", "--prefix"))
-    if rest:
-        die("usage: fx-cloud init [--team TEAM] [--project PROJECT] [--prefix PREFIX]", 2)
-    try:
-        with open(CONFIG_FILE) as f:
-            current = json.load(f)
-    except FileNotFoundError:
-        current = {}
-    except (OSError, ValueError) as e:
-        die("cannot read %s: %s; fix it or remove it" % (short(CONFIG_FILE), e))
-    if not isinstance(current, dict):
-        die("%s must hold a JSON object; fix it or remove it" % short(CONFIG_FILE))
-    who = subprocess.run(["vercel", "whoami"], capture_output=True, text=True)
-    user = (who.stdout.strip().splitlines() or [""])[-1].strip()
-    if who.returncode != 0 or not user:
-        sys.stderr.write((who.stdout + who.stderr)[-1000:])
-        die("the Vercel CLI is not logged in; run `vercel login`, then `fx-cloud init` again")
-    say("the Vercel CLI is logged in as %s" % user)
-    team = flags.get("--team") or ask("Vercel team (the slug in vercel.com/<team>)", current.get("team"))
-    project = flags.get("--project") or ask("Vercel project for the sandboxes", current.get("project"))
-    prefix = flags.get("--prefix") or current.get("prefix") or DEFAULTS["prefix"]
-    if not (team or "").strip() or not (project or "").strip():
-        die("fx-cloud init needs a team and a project: fx-cloud init --team TEAM --project PROJECT", 2)
-    new = dict(DEFAULTS)
-    new.update(current)
-    new.update(team=team, project=project, prefix=prefix)
-    try:
-        CFG = check_config({k: v for k, v in new.items() if k in DEFAULTS}, required=True)
-    except ConfigError as e:
-        die(str(e))
-    p = subprocess.run(vercel("list", "--limit", "1"), capture_output=True, text=True)
-    if p.returncode != 0:
-        sys.stderr.write((p.stdout + p.stderr)[-1500:])
-        die("cannot list the sandboxes of %s/%s. Check the team slug and the project name. To make the "
-            "project, run: vercel project add %s --scope %s" % (team, project, project, team))
-    say("%s/%s has Vercel Sandbox access" % (team, project))
-    write_json(CONFIG_FILE, new)
-    CONFIG_FOUND = True
-    say("wrote %s" % short(CONFIG_FILE))
-    if os.path.exists(BASE_FILE) and not read_base():
-        say("note: the base snapshot in %s is for other settings; `fx-cloud base` makes one for these"
-            % short(BASE_FILE))
-    print("Next steps:")
-    if not read_base():
-        print("  fx-cloud base          build the base snapshot (about a minute; 5 to 12 with warm builds)")
-    print("  fx-cloud login         optional: sign the base in to GitHub (private repositories) and fx")
-    print("  fx-cloud run <command> from a project folder, for example: fx-cloud run zig build test")
-    print("Other settings, such as vcpus, idle_minutes, warm and setup_hook, are in %s." % short(CONFIG_FILE))
-    return 0
-
+# --------------------------------------------------------------------------- the rest
 
 def cmd_shell(args):
     global SANDBOX
     if "--base" in args:
         SANDBOX = (read_base() or {}).get("sandbox") or die("there is no base yet; run `fx-cloud base`")
-        return subprocess.call(vercel("connect", *TERM_ENV, SANDBOX))
+        return subprocess.call(vercel("connect", "--workdir", WS, *TERM_ENV, SANDBOX))
     rc, _ = run_here("true", {})  # this agent's sandbox, with this folder copied
     if rc != 0:
         return rc
@@ -2387,57 +2277,73 @@ def cmd_shell(args):
 
 def cmd_extend(args):
     if len(args) != 1:
-        die("usage: fx-cloud extend <duration>, for example 1h", 2)
-    if use_sandbox(folder_root(os.getcwd()), create=False) is None:
+        die("usage: fx-cloud extend <duration>, for example 2h", 2)
+    if use_sandbox(folder_root(os.getcwd()), create=False) is None and not (LEGACY or SANDBOX == FALLBACK):
         die("this agent has no sandbox for this folder")
     return subprocess.call(vercel("extend", SANDBOX, args[0]))
 
 
+def cmd_stop(args):
+    if not LEGACY:
+        return cmd_done(args)  # an agent sandbox keeps no files when it stops, so remove it
+    return subprocess.call(vercel("stop", SANDBOX))
+
+
 def cmd_status(_args):
-    print("settings: %s" % short(CONFIG_FILE))
-    print("team / project: %s / %s; sandbox names start with %s" % (CFG["team"], CFG["project"], CFG["prefix"]))
-    base = read_base()
-    if base:
-        print("base snapshot: %s, made %s ago in %s%s" % (base["snapshot"], ago(base["created"]), base["sandbox"],
-                                                          "" if base.get("warm", True) else " (no warm builds)"))
-    else:
-        print("base snapshot: none; run `fx-cloud base`")
-    print("agent sandboxes known on this Mac: %d (`fx-cloud ls` lists them)" % len(all_entries()))
-    print("each: %d vCPUs, ends after %d idle minutes; a note when more than %d are open"
-          % (CFG["vcpus"], CFG["idle_minutes"], CFG["max_agents"]))
-    if CFG["local_only"]:
-        print("local only (the shims run these here): %s" % ", ".join(CFG["local_only"]))
-    if CFG["warm"]:
-        print("warm repositories: %s" % ", ".join(w["repo"] for w in CFG["warm"]))
-    if CFG["setup_hook"]:
-        print("setup hook: %s" % short(CFG["setup_hook"]))
+    if not LEGACY:
+        base = read_base()
+        if base:
+            print("base snapshot: %s, made %s ago in %s" % (base["snapshot"], ago(base["created"]), base["sandbox"]))
+        else:
+            print("base snapshot: none; run fx-cloud base (until then, commands use %s)" % FALLBACK)
+        entries = all_entries()
+        print("agent sandboxes known on this Mac: %d (fx-cloud ls lists them)" % len(entries))
+        print("each: %s vCPUs, ends after %d idle minutes; at most %d before a warning"
+              % (AGENT_VCPUS, IDLE_MIN, MAX_AGENTS))
+        print("Mac fx: %s" % json.dumps(local_build()))
+        return 0
+    p = subprocess.run(vercel("list"), capture_output=True, text=True)
+    rows = [l for l in p.stdout.splitlines() if l.split()[:1] in (["NAME"], [SANDBOX])]
+    print("\n".join(rows) if rows else "sandbox %s not found; run fx-cloud setup" % SANDBOX)
+    if not any(l.split()[:1] == [SANDBOX] for l in rows):
+        return 1
+    print("Mac fx:     %s" % json.dumps(local_build()))
+    remote = run_remote("fx status --json", check=False).stdout
+    try:
+        d = json.loads(remote)
+        print("sandbox fx: %s" % json.dumps({"channel": d.get("build_channel"), "revision": d.get("build_revision")}))
+    except ValueError:
+        print("sandbox fx: unknown")
     return 0
 
 
 COMMANDS = {
-    "init": cmd_init, "run": cmd_run, "push": cmd_push, "agent": cmd_agent, "pull": cmd_pull,
-    "macos-build": cmd_macos_build, "base": cmd_base, "setup": cmd_base, "login": cmd_login,
-    "shell": cmd_shell, "extend": cmd_extend, "stop": cmd_done, "status": cmd_status,
+    "run": cmd_run, "push": cmd_push, "agent": cmd_agent, "pull": cmd_pull,
+    "macos-build": cmd_macos_build, "setup": cmd_setup, "base": cmd_base, "login": cmd_login,
+    "shell": cmd_shell, "extend": cmd_extend, "stop": cmd_stop, "status": cmd_status,
     "done": cmd_done, "ls": cmd_ls, "gc": cmd_gc, "zig": cmd_zig, "bun": cmd_bun, "tla": cmd_tla,
 }
-SHIM_COMMANDS = ("zig", "bun", "tla")  # they need the settings only when they send work away
+
+
+def fallback_removed():
+    return os.path.exists(os.path.join(HOME, ".config", "fx-cloud", FALLBACK + "-removed"))
 
 
 def main(argv):
+    global LEGACY, SANDBOX
+    if LEGACY == FALLBACK and fallback_removed():
+        say("note: the shared sandbox %s is removed, so this uses the agent's own sandbox; "
+            "leave out FXC_SANDBOX" % FALLBACK)
+        LEGACY = SANDBOX = ""
     if argv and argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
-    if not argv or argv[0] not in COMMANDS:
-        print(__doc__.strip(), file=sys.stderr)
-        if argv:
-            say("unknown command %s" % argv[0])
-        return 2
-    cmd = argv[0]
-    if cmd not in SHIM_COMMANDS and shutil.which("vercel") is None:
-        die("the Vercel CLI is missing; install it with `npm i -g vercel`, then run `vercel login`")
-    if cmd != "init":
-        setup_config(required=cmd not in SHIM_COMMANDS)
-    return COMMANDS[cmd](argv[1:]) or 0
+    if shutil.which("vercel") is None:
+        die("the vercel CLI is missing; install it with: brew install vercel-cli")
+    if argv and argv[0] in COMMANDS:
+        return COMMANDS[argv[0]](argv[1:]) or 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

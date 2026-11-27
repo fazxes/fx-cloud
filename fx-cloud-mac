@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""fx-cloud-mac: a trial of fx-cloud's run/push/pull flow on a Daytona macOS sandbox.
+
+The sandbox is a macOS VM on a Mac that your Daytona organization has reserved. This script never
+buys a Mac: `up` uses a reservation that you already hold and that has room for one more sandbox.
+A reservation costs $60.08 for 24 hours and renews itself while a sandbox on it runs, so `done`
+deletes the sandbox, and every sandbox also deletes itself after FXM_IDLE_MINUTES idle (30) or
+FXM_HOURS (3) in total.
+
+Run from inside a git worktree on the Mac:
+  fx-cloud-mac up                      create this trial's sandbox (or reuse it) and install Zig
+  fx-cloud-mac run [--no-push] <cmd>   copy the worktree to the sandbox, then run the command there,
+                                       in the same folder; output streams back and the exit code
+                                       is the sandbox's
+  fx-cloud-mac push                    only copy the worktree
+  fx-cloud-mac pull <path> [<dest>]    copy a file or folder from the sandbox copy to the Mac
+  fx-cloud-mac shell                   open a login shell in the sandbox, in the worktree's folder
+  fx-cloud-mac status                  show the sandbox and the reservation it runs on
+  fx-cloud-mac done                    delete the sandbox (the reservation stays until its end)
+
+The copy lives at the same path in the sandbox. It holds the tracked, changed and new files of the
+worktree; ignored files and .git stay on the Mac. Files deleted on the Mac stay in the copy.
+Settings: FXM_RESERVATION, FXM_CORES, FXM_MEMORY_MIB, FXM_IDLE_MINUTES, FXM_HOURS, FXM_ZIG.
+FXM_SANDBOX=<id> sends every command to that sandbox instead.
+"""
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+DAYTONA = shutil.which("daytona") or os.path.expanduser("~/.local/bin/daytona")
+STATE = os.path.expanduser("~/.config/fx-cloud/mac-sandbox.json")
+ZIG = os.environ.get("FXM_ZIG", "0.17.1")
+IDLE_MIN = max(5, int(os.environ.get("FXM_IDLE_MINUTES", "30")))
+HOURS = max(1, int(os.environ.get("FXM_HOURS", "3")))
+SLOTS_PER_MAC = 2
+REMOTE_PATH = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
+
+
+def say(msg):
+    print("fx-cloud-mac: " + msg, file=sys.stderr, flush=True)
+
+
+def die(msg, code=1):
+    say(msg)
+    sys.exit(code)
+
+
+def dt_json(*args):
+    """Runs a daytona command with JSON output and returns the parsed result."""
+    p = subprocess.run([DAYTONA, *args, "-o", "json"], capture_output=True, text=True)
+    if p.returncode != 0:
+        die("daytona %s failed: %s" % (" ".join(args[:2]), (p.stderr or p.stdout).strip()[:500]))
+    return json.loads(p.stdout or "null")
+
+
+def read_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(st, f, indent=1)
+
+
+def sandbox_id(required=True):
+    sid = os.environ.get("FXM_SANDBOX") or read_state().get("id")
+    if not sid and required:
+        die("there is no sandbox; run: fx-cloud-mac up")
+    return sid
+
+
+def sandbox_status(sid):
+    p = subprocess.run([DAYTONA, "sandbox", "get", sid, "-o", "json"], capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    return json.loads(p.stdout)
+
+
+def worktree_top():
+    p = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if p.returncode != 0:
+        die("run fx-cloud-mac from inside a git worktree")
+    return p.stdout.strip()
+
+
+def ssh(sid, script, stdin=None):
+    """Runs SCRIPT in a login zsh in the sandbox over the SSH gateway and returns its exit code."""
+    return subprocess.call([DAYTONA, "sandbox", "ssh", sid, "-o", "BatchMode=yes",
+                            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
+                            "zsh -lc " + shlex.quote(script)], stdin=stdin)
+
+
+def pick_reservation():
+    """The ID of a live reservation with room for one more sandbox. Never buys one."""
+    want = os.environ.get("FXM_RESERVATION")
+    items = dt_json("reservation", "list").get("items", [])
+    for r in items:
+        if want and r["id"] != want:
+            continue
+        if r["status"] == "active" and r.get("slots_used", 0) < SLOTS_PER_MAC:
+            return r
+    die("no reserved Mac has room for a sandbox. Reserve one in the dashboard or with "
+        "`daytona reservation create` ($60.08 for 24 hours); this script does not buy Macs")
+
+
+BOOTSTRAP = r"""
+set -e
+echo lume | sudo -S -p "" sh -c 'mkdir -p "$1" && chown lume:staff "$1"' sh %(home)s
+mkdir -p "$HOME/.local/bin" "$HOME/.local/zig"
+if [ "$("$HOME/.local/bin/zig" version 2>/dev/null)" != "%(zig)s" ]; then
+  set -- $(curl -fsSL https://ziglang.org/download/index.json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)[sys.argv[1]]["aarch64-macos"]
+print(d["tarball"], d["shasum"])' %(zig)s)
+  echo "[up] zig %(zig)s from $1"
+  curl -fsSL -o /tmp/zig.tar.xz "$1"
+  echo "$2  /tmp/zig.tar.xz" | shasum -a 256 -c --quiet -
+  tar -xJf /tmp/zig.tar.xz -C "$HOME/.local/zig"
+  ln -sfn "$HOME/.local/zig/$(basename "$1" .tar.xz)/zig" "$HOME/.local/bin/zig"
+  rm -f /tmp/zig.tar.xz
+fi
+echo "[up] $(sw_vers -productName) $(sw_vers -productVersion), $(sysctl -n hw.ncpu) cores, zig $("$HOME/.local/bin/zig" version), $(xcodebuild -version | head -1)"
+"""
+
+
+def cmd_up(_args):
+    sid = sandbox_id(required=False)
+    if sid:
+        sb = sandbox_status(sid)
+        if sb and sb.get("status") == "running":
+            say("reusing sandbox %s" % sid)
+            return ssh(sid, BOOTSTRAP % {"home": shlex.quote(os.path.expanduser("~")), "zig": ZIG})
+        say("sandbox %s is gone or not running; creating a new one" % sid)
+    r = pick_reservation()
+    t0 = time.time()
+    name = "fxc-mac-%s" % time.strftime("%Y%m%d-%H%M%S")
+    args = ["sandbox", "create-macos", "--image", "base-macos", "--reservation", r["id"],
+            "--name", name, "--label", "fxc=mac",
+            "--idle-timeout", "%dm" % IDLE_MIN, "--on-idle-timeout", "delete",
+            "--lifecycle-timeout", "%dh" % HOURS, "--on-lifecycle-timeout", "delete"]
+    if os.environ.get("FXM_CORES"):
+        args += ["--cores", os.environ["FXM_CORES"]]
+    if os.environ.get("FXM_MEMORY_MIB"):
+        args += ["--memory", os.environ["FXM_MEMORY_MIB"]]
+    sb = dt_json(*args)
+    sid = sb["id"]
+    write_state({"id": sid, "reservation": r["id"], "created": time.time()})
+    say("sandbox %s is %s after %.0f s (%s cores, %d MiB) on the Mac reserved until %s"
+        % (sid, sb["status"], time.time() - t0, sb.get("cpu"), sb.get("memory_mib", 0), r["period_end"]))
+    rc = ssh(sid, BOOTSTRAP % {"home": shlex.quote(os.path.expanduser("~")), "zig": ZIG})
+    say("ready after %.0f s" % (time.time() - t0) if rc == 0 else "setup failed (exit %d)" % rc)
+    return rc
+
+
+def push(sid):
+    top = worktree_top()
+    out = subprocess.run(["git", "-C", top, "ls-files", "-z", "-c", "-o", "--exclude-standard"],
+                         capture_output=True, check=True).stdout
+    files = sorted(set(x.decode() for x in out.split(b"\0") if x and b"\n" not in x))
+    files = [f for f in files if os.path.lexists(os.path.join(top, f))]
+    t0 = time.time()
+    with tempfile.NamedTemporaryFile("w", suffix=".list") as lst:
+        lst.write("\n".join(files) + "\n")
+        lst.flush()
+        rc = subprocess.call(["rsync", "-a", "--files-from=" + lst.name,
+                              "--rsync-path=mkdir -p %s && rsync" % shlex.quote(top),
+                              "-e", "%s __rsh" % shlex.quote(os.path.abspath(__file__)),
+                              top + "/", "%s:%s/" % (sid, top)])
+    if rc != 0:
+        die("the copy failed (rsync exit %d)" % rc, rc)
+    say("copied %s (%d files) in %.1f s" % (top, len(files), time.time() - t0))
+    return top
+
+
+def cmd_rsh(args):
+    """rsync's remote shell: `<this> __rsh <sandbox-id> <command...>`."""
+    sid, rest = args[0], args[1:]
+    os.execv(DAYTONA, [DAYTONA, "sandbox", "ssh", sid, "-o", "BatchMode=yes",
+                       "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR", *rest])
+
+
+def cmd_push(_args):
+    push(sandbox_id())
+    return 0
+
+
+def cmd_run(args):
+    no_push = bool(args) and args[0] == "--no-push"
+    if no_push:
+        args = args[1:]
+    if not args:
+        die("usage: fx-cloud-mac run [--no-push] <command>", 2)
+    sid = sandbox_id()
+    if not no_push:
+        push(sid)
+    script = args[0] if len(args) == 1 else shlex.join(args)
+    t0 = time.time()
+    rc = subprocess.call([DAYTONA, "sandbox", "exec", sid, "--cwd", os.getcwd(),
+                          "--timeout", "%dh" % HOURS, "--",
+                          "/bin/zsh", "-lc", REMOTE_PATH + "\n" + script], stdin=subprocess.DEVNULL)
+    say("exit %d after %.1f s" % (rc, time.time() - t0))
+    return rc
+
+
+def cmd_pull(args):
+    if not args or len(args) > 2:
+        die("usage: fx-cloud-mac pull <path> [<dest>]", 2)
+    sid = sandbox_id()
+    src = os.path.abspath(args[0])
+    dest = os.path.abspath(args[1]) if len(args) == 2 else os.path.dirname(src)
+    os.makedirs(dest, exist_ok=True)
+    rc = subprocess.call(["rsync", "-a", "-e", "%s __rsh" % shlex.quote(os.path.abspath(__file__)),
+                          "%s:%s" % (sid, src), dest + "/"])
+    if rc == 0:
+        say("pulled %s to %s" % (src, dest))
+    return rc
+
+
+def cmd_shell(_args):
+    sid = sandbox_id()
+    os.execv(DAYTONA, [DAYTONA, "sandbox", "exec", sid, "--tty", "--cwd", os.getcwd(), "--",
+                       "/bin/zsh", "-lc", REMOTE_PATH + "\nexec zsh -l"])
+
+
+def cmd_status(_args):
+    sid = sandbox_id(required=False)
+    if not sid:
+        print("sandbox: none")
+    else:
+        sb = sandbox_status(sid)
+        if not sb:
+            print("sandbox: %s (gone)" % sid)
+        else:
+            lp = sb.get("lifecycle_policy") or {}
+            print("sandbox: %s, %s, %s cores, %d MiB; deletes itself at %s (idle) or %s (lifetime)"
+                  % (sid, sb["status"], sb.get("cpu"), sb.get("memory_mib", 0),
+                     lp.get("idle_timeout_at"), lp.get("timeout_at")))
+    for r in dt_json("reservation", "list").get("items", []):
+        print("reservation: %s, %s, %s, %d of %d slots used, ends %s, auto-renew %s"
+              % (r["id"], r["model"], r["status"], r.get("slots_used", 0), SLOTS_PER_MAC,
+                 r["period_end"], "on" if r.get("auto_renew") else "off"))
+    return 0
+
+
+def cmd_done(_args):
+    sid = sandbox_id(required=False)
+    if not sid:
+        say("there is no sandbox")
+        return 0
+    p = subprocess.run([DAYTONA, "sandbox", "delete", sid, "--yes", "-o", "json"],
+                       capture_output=True, text=True)
+    if p.returncode != 0 and sandbox_status(sid):
+        die("could not delete %s: %s" % (sid, (p.stderr or p.stdout).strip()[:300]))
+    if not os.environ.get("FXM_SANDBOX"):
+        try:
+            os.remove(STATE)
+        except OSError:
+            pass
+    say("deleted %s; the reservation stays until the end of its period" % sid)
+    return 0
+
+
+COMMANDS = {"up": cmd_up, "run": cmd_run, "push": cmd_push, "pull": cmd_pull, "shell": cmd_shell,
+            "status": cmd_status, "done": cmd_done, "__rsh": cmd_rsh}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if not os.path.exists(DAYTONA):
+        die("the daytona CLI is not installed")
+    fn = COMMANDS.get(sys.argv[1])
+    if not fn:
+        die("unknown command %s; see fx-cloud-mac --help" % sys.argv[1], 2)
+    return fn(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
