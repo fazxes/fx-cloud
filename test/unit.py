@@ -15,8 +15,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import types
 import unittest
+import zlib
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -500,6 +502,19 @@ class TlaLogTests(unittest.TestCase):
             self.assertEqual(f.read(), "hi")
         self.assertTrue(os.path.isfile(os.path.join(run_dir, "a.log")))
 
+    def test_remote_script_warns_and_still_runs_when_the_run_dir_cannot_be_made(self):
+        blocker, seen = self.path("file"), self.path("seen")
+        self.write_text(blocker, "not a folder\n")
+        run_dir = os.path.join(blocker, "run")
+        command = "sh -c " + shlex.quote("echo ran > " + shlex.quote(seen) + "; exit 7")
+        script = tla.remote_script(command, run_dir, "true")
+        result = subprocess.run(["bash", "-c", script], capture_output=True)
+        self.assertEqual(result.returncode, 7)
+        with open(seen) as f:
+            self.assertEqual(f.read(), "ran\n")
+        warning = "fx-cloud: could not make %s, so the logs of this run stay in the sandbox\n" % run_dir
+        self.assertIn(warning, result.stderr.decode())
+
     def test_pick_logs_keeps_small_logs_and_reports_big_ones(self):
         entries = [("b/x.log", 5), ("a/y.out", 3), ("a/z.txt", 1),
                    ("a/M.states/s.log", 1), ("a/M.tmp/t.log", 1), ("big.log", 50)]
@@ -534,7 +549,7 @@ class TlaLogTests(unittest.TestCase):
             names = sorted(tar.getnames())
             manifest = tar.extractfile(".fxc-skipped").read().decode()
         self.assertEqual(names, [".fxc-skipped", "a/x.log"])
-        self.assertEqual(manifest, "big.log\t20\n")
+        self.assertEqual(json.loads(manifest), [{"path": "big.log", "bytes": 20}])
 
     def test_packlogs_writes_an_empty_tarball_when_the_folder_is_missing(self):
         out = self.path("out.tgz")
@@ -579,9 +594,9 @@ class TlaLogTests(unittest.TestCase):
             link.type = tarfile.SYMTYPE
             link.linkname = "/etc/passwd"
             tar.addfile(link)
-            self.add_file(tar, ".fxc-skipped", b"big.log\t99\n")
+            self.add_file(tar, ".fxc-skipped", json.dumps([{"path": "big.log", "bytes": 99}]).encode())
         result = tla.extract_logs(tgz, dest)
-        self.assertEqual(result, (1, ["big.log\t99"], None))
+        self.assertEqual(result, (1, [("big.log", 99)], 2, None))
         with open(os.path.join(dest, "ok", "x.log")) as f:
             self.assertEqual(f.read(), "hi")
         self.assertEqual(os.stat(os.path.join(dest, "ok", "x.log")).st_mode & 0o777, 0o600)
@@ -589,15 +604,78 @@ class TlaLogTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(os.path.join(dest, "ok", "link")))
         self.assertFalse(os.path.exists(os.path.join(dest, ".fxc-skipped")))
 
+    def test_extract_logs_refuses_files_over_the_size_limits(self):
+        tgz, dest = self.path("logs.tgz"), self.path("run")
+        with tarfile.open(tgz, "w:gz") as tar:
+            self.add_file(tar, "a.log", b"x" * 8)
+            self.add_file(tar, "b.log", b"x" * 8)
+            self.add_file(tar, "c.log", b"x" * 12)
+        with mock.patch.object(tla, "MAX_LOG_FILE_BYTES", 10), mock.patch.object(tla, "MAX_LOG_TOTAL_BYTES", 15):
+            result = tla.extract_logs(tgz, dest)
+        self.assertEqual(result, (1, [], 2, None))
+        self.assertEqual(os.listdir(dest), ["a.log"])
+
     def test_extract_logs_reports_a_broken_tarball(self):
         tgz = self.path("broken.tgz")
         with open(tgz, "wb") as f:
             f.write(b"this is not a tarball")
-        count, skipped, error = tla.extract_logs(tgz, self.path("run"))
+        count, skipped, refused, error = tla.extract_logs(tgz, self.path("run"))
         self.assertEqual(count, 0)
         self.assertEqual(skipped, [])
+        self.assertEqual(refused, 0)
         self.assertIsInstance(error, str)
         self.assertTrue(error)
+
+    def test_extract_logs_reports_zlib_errors(self):
+        with mock.patch.object(tla.tarfile, "open", side_effect=zlib.error("bad stream")):
+            result = tla.extract_logs(self.path("logs.tgz"), self.path("run"))
+        self.assertEqual(result, (0, [], 0, "bad stream"))
+
+    def test_extract_logs_escapes_control_characters_in_its_error(self):
+        with mock.patch.object(tla.tarfile, "open", side_effect=tarfile.ReadError("bad \x1b[31mname")):
+            result = tla.extract_logs(self.path("logs.tgz"), self.path("run"))
+        self.assertEqual(result, (0, [], 0, "bad \\x1b[31mname"))
+
+    def test_skipped_list_survives_tabs_and_newlines_in_names(self):
+        log_dir, out, dest = self.path("logs"), self.path("out.tgz"), self.path("run")
+        self.write_text(os.path.join(log_dir, "odd\tname\nx.log"), "x" * 20)
+        with mock.patch.object(remote, "LOG_FILE_LIMIT_BYTES", 10):
+            remote.op_packlogs(log_dir, out)
+        self.assertEqual(tla.extract_logs(out, dest), (0, [("odd\tname\nx.log", 20)], 0, None))
+
+    def test_skipped_note_escapes_control_characters_and_quotes_the_path(self):
+        note = tla.skipped_note(("a\x1b[31mb.log", 31457280), "/tmp/fxc-tla-501/ab12cd34")
+        self.assertEqual(note, "/tmp/fxc-tla-501/ab12cd34/a\\x1b[31mb.log is too large to copy back (30.0 MB); "
+                               "get it with: fx-cloud pull $'/tmp/fxc-tla-501/ab12cd34/a\\x1b[31mb.log' <dest>")
+        self.assertNotIn("\x1b", note)
+
+    def test_skipped_note_shows_the_real_size_of_a_small_file(self):
+        self.assertIn("(6 KB)", tla.skipped_note(("b.log", 6 * 1024), "/r"))
+        self.assertIn("(300 bytes)", tla.skipped_note(("c.log", 300), "/r"))
+        self.assertIn("(1023 KB)", tla.skipped_note(("d.log", 1048575), "/r"))
+
+    def test_log_notes_mentions_refused_entries(self):
+        self.assertEqual(tla.log_notes(0, [], 2, "/r"),
+                         ["left out 2 entries from the sandbox that were not plain log files under /r"])
+
+    def test_shell_quote_printable_round_trips_through_bash(self):
+        texts = ["a'b\\c\x1bd é", "zw\u200bsp.log"]
+        for shell in ("/bin/bash", "/bin/zsh"):
+            for text in texts:
+                with self.subTest(shell=shell, text=text):
+                    if not os.path.exists(shell):
+                        self.skipTest(shell + " is not installed")
+                    result = subprocess.run([shell, "-f", "-c", "printf %s " + tla.shell_quote_printable(text)],
+                                            capture_output=True, check=True)
+                    self.assertEqual(result.stdout.decode("utf-8"), text)
+
+    def test_read_manifest_keeps_only_valid_entries(self):
+        manifest = [{"path": "a.log", "bytes": 5}, "x", {"path": "b.log"},
+                    {"path": "c.log", "bytes": 1.5}, {"path": "d.log", "bytes": True}]
+        self.assertEqual(tla.read_manifest(io.BytesIO(json.dumps(manifest).encode())), [("a.log", 5)])
+
+    def test_read_manifest_ignores_invalid_json(self):
+        self.assertEqual(tla.read_manifest(io.BytesIO(b"not json")), [])
 
     def test_logs_parent_must_be_a_private_folder_of_this_user(self):
         logs, link = self.path("logs"), self.path("link")
@@ -611,6 +689,10 @@ class TlaLogTests(unittest.TestCase):
 
     def test_skipped_manifest_names_match(self):
         self.assertEqual(tla.SKIPPED_MANIFEST, remote.SKIPPED_MANIFEST)
+
+    def test_mac_size_limits_match_the_sandbox_side(self):
+        self.assertEqual(tla.MAX_LOG_FILE_BYTES, remote.LOG_FILE_LIMIT_BYTES)
+        self.assertEqual(tla.MAX_LOG_TOTAL_BYTES, remote.LOG_TOTAL_LIMIT_BYTES)
 
     def test_main_runs_the_wrapped_command_and_brings_logs_back(self):
         repo = self.path("proj")
@@ -647,22 +729,44 @@ class TlaLogTests(unittest.TestCase):
         self.assertEqual(uid, os.getuid())
         self.assertRegex(run_dir, "^/tmp/fxc-tla-%d/[0-9a-f]{8}$" % os.getuid())
 
+    def test_main_keeps_the_exit_code_when_the_copy_back_breaks(self):
+        repo = self.path("proj")
+        self.write_text(os.path.join(repo, "tests", "tla", "demo", "check.sh"), "exit 0\n")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(repo)
+        said = []
+        core = types.SimpleNamespace(
+            take_flags=fxc.take_flags,
+            die=fxc.die,
+            subprocess=subprocess,
+            project_allows_remote=lambda path: True,
+            need_config=lambda tool: None,
+            say=said.append,
+            helper_script=lambda op, *a: "PACK " + op + " " + " ".join(a),
+            run_here=lambda script, flags, capture=False: (3, b""),
+        )
+        with mock.patch.object(tla, "bring_logs_back", side_effect=zlib.error("bad data")):
+            code = tla.main(core, ["--tool", "sh", "--real", "/bin/sh", "--", "tests/tla/demo/check.sh"])
+        self.assertEqual(code, 3)
+        self.assertEqual(said[-1], "could not copy the TLC logs back: bad data")
+
     def copy_download(self, source, argv):
         with open(source, "rb") as f, open(argv[-1], "wb") as out:
             out.write(f.read())
-        return 0
+        return types.SimpleNamespace(returncode=0, stderr="")
 
     def leftover_downloads(self):
         root = self.path("logs-root")
         return [name for name in os.listdir(root) if name.startswith("logs-") and name.endswith(".tgz")]
 
-    def bring_back(self, call, run_dir):
+    def bring_back(self, run, run_dir):
         said = []
         core = types.SimpleNamespace(
             SANDBOX="fxa-test",
             say=said.append,
             vercel=lambda sub, *args: [sub] + list(args),
-            subprocess=types.SimpleNamespace(call=call, DEVNULL=subprocess.DEVNULL),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE),
         )
         tla.bring_logs_back(core, run_dir, os.getuid())
         return said
@@ -672,7 +776,8 @@ class TlaLogTests(unittest.TestCase):
         source = self.path("source.tgz")
         with tarfile.open(source, "w:gz") as tar:
             self.add_file(tar, "fx-tla-demo.X/Demo.log", b"model error")
-            self.add_file(tar, ".fxc-skipped", b"fx-tla-demo.X/Big.log\t31457280\n")
+            manifest = [{"path": "fx-tla-demo.X/Big.log", "bytes": 31457280}]
+            self.add_file(tar, ".fxc-skipped", json.dumps(manifest).encode())
         call = mock.Mock(side_effect=lambda argv, **kw: self.copy_download(source, argv))
         said = self.bring_back(call, run_dir)
         with open(os.path.join(run_dir, "fx-tla-demo.X", "Demo.log")) as f:
@@ -681,24 +786,62 @@ class TlaLogTests(unittest.TestCase):
         self.assertEqual(call.call_args.args[0][1], "fxa-test:" + run_dir + ".tgz")
         self.assertEqual(said, [
             "copied 1 TLC log file to " + run_dir,
-            run_dir + "/fx-tla-demo.X/Big.log is too large to copy (30 MB); get it with: fx-cloud pull "
-            + run_dir + "/fx-tla-demo.X/Big.log <dest>",
+            run_dir + "/fx-tla-demo.X/Big.log is too large to copy back (30.0 MB); get it with: fx-cloud pull "
+            + shlex.quote(run_dir + "/fx-tla-demo.X/Big.log") + " <dest>",
         ])
         self.assertEqual(self.leftover_downloads(), [])
 
     def test_bring_logs_back_says_so_when_the_download_fails(self):
         run_dir = self.path("logs-root", "ab12cd34")
-        said = self.bring_back(mock.Mock(return_value=1), run_dir)
-        self.assertEqual(said, ["could not copy the TLC logs back from the sandbox (" + run_dir + ".tgz)"])
+        run = mock.Mock(return_value=types.SimpleNamespace(returncode=1, stderr="Vercel CLI 50.1\nError: file not found\n"))
+        said = self.bring_back(run, run_dir)
+        self.assertEqual(said, ["could not copy the TLC logs back from the sandbox: Error: file not found; "
+                                "get them with: fx-cloud pull " + shlex.quote(run_dir + ".tgz") + " ."])
         self.assertEqual(self.leftover_downloads(), [])
 
     def test_bring_logs_back_keeps_going_when_the_download_file_cannot_be_made(self):
         run_dir = self.path("logs-root", "ab12cd34")
-        call = mock.Mock(return_value=0)
+        call = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stderr=""))
         with mock.patch.object(tla.tempfile, "mkstemp", side_effect=OSError("disk full")):
             said = self.bring_back(call, run_dir)
         call.assert_not_called()
         self.assertEqual(said, ["could not copy the TLC logs back: disk full"])
+
+    def test_fetch_logs_reports_why_the_cli_could_not_start(self):
+        run = mock.Mock(side_effect=OSError("No such file or directory: 'vercel'"))
+        core = types.SimpleNamespace(
+            SANDBOX="fxa-test",
+            vercel=lambda sub, *args: [sub] + list(args),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE),
+        )
+        self.assertEqual(tla.fetch_logs(core, "/r/x", "/tmp/t.tgz"), (False, "No such file or directory: 'vercel'"))
+
+    def test_fetch_logs_names_the_error_when_it_has_no_text(self):
+        run = mock.Mock(side_effect=OSError())
+        core = types.SimpleNamespace(
+            SANDBOX="fxa-test",
+            vercel=lambda sub, *args: [sub] + list(args),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE),
+        )
+        self.assertEqual(tla.fetch_logs(core, "/r/x", "/tmp/t.tgz"), (False, "OSError"))
+
+    def test_stale_downloads_picks_old_downloads_only(self):
+        entries = [("logs-a.tgz", 0), ("logs-b.tgz", 9999), ("other.tgz", 0), ("logs-c.txt", 0)]
+        self.assertEqual(tla.stale_downloads(entries, 10000), ["logs-a.tgz"])
+
+    def test_bring_logs_back_removes_stale_downloads(self):
+        folder = self.path("logs-root")
+        hour_ago = time.time() - 3600
+        old, new, other = [os.path.join(folder, name) for name in ("logs-old.tgz", "logs-new.tgz", "other.tgz")]
+        for path in (old, other):
+            self.write_text(path, "x")
+            os.utime(path, (hour_ago, hour_ago))
+        self.write_text(new, "x")
+        run = mock.Mock(return_value=types.SimpleNamespace(returncode=1, stderr="Error: gone\n"))
+        self.bring_back(run, os.path.join(folder, "ab12cd34"))
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+        self.assertTrue(os.path.exists(other))
 
 
 if __name__ == "__main__":

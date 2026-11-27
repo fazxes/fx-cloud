@@ -487,7 +487,8 @@ def log_entries(log_dir):
 
 
 def add_skipped_manifest(tar, skipped):
-    data = "".join("%s\t%d\n" % (relpath, size) for relpath, size in skipped).encode()
+    entries = [{"path": relpath, "bytes": size} for relpath, size in skipped]
+    data = json.dumps(entries).encode("utf-8")
     info = tarfile.TarInfo(SKIPPED_MANIFEST)
     info.size = len(data)
     tar.addfile(info, io.BytesIO(data))

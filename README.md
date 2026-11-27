@@ -117,7 +117,10 @@ Zig compiles `build.zig` into native programs, and sandboxes land on a few diffe
 - `"setup_hook": "<this folder>/extras/fx/setup.sh"` adds Java 21 with `tla2tools.jar` for the TLA+ model checks, zsh and fish for the shell tests, and CI's tmux defaults to the base.
 - `export PATH="<this folder>/extras/fx/shims:$PATH"` sends `sh`, `bash`, and `python3` calls of TLA+ runners under `tests/tla/` (such as `sh tests/tla/<spec>/check.sh`) to the sandbox, through `fx-cloud tla`.
 
-Each TLA+ run gets its own `TMPDIR` in the sandbox, `/tmp/fxc-tla-<uid>/<id>`. When the run ends, its log files (`*.log`, `*.out`, and the drivers' `report.json`, up to 20 MB each and 50 MB in all) come back to the same path on the Mac, so the `logs:` and `(see …)` paths that TLC prints work there. The `*.states` and `*.tmp` folders stay in the sandbox. A log that is too large stays there too, and fx-cloud prints the `fx-cloud pull` command for it. The copy never changes the exit code of the run.
+- The copy-back covers TLA+ runner scripts that the `sh`, `bash`, and `python3` shims send to the sandbox through `fx-cloud tla`. A direct `bun` driver run and `fx-cloud run` do not copy logs back yet.
+- Each such run gets its own `TMPDIR` in the sandbox, `/tmp/fxc-tla-<uid>/<id>`. When the run ends, its `*.log` and `*.out` files and the drivers' `report.json` files come back to the same path on the Mac, in a folder that only you can read, so the `logs:` and `(see …)` paths that TLC prints work there. Each file is up to 20 MB, and the copy is up to 50 MB in all. The `*.states` and `*.tmp` folders stay in the sandbox.
+- fx-cloud prints a note on stderr for each thing it reports: what it copied; each file that did not fit the limits, with the `fx-cloud pull` command to get it, since the run folder stays in the sandbox; each entry it left out of the copy because it was not a plain log file; or why the copy failed. If the run folder cannot be made, the check still runs, and a warning says its logs stay in the sandbox.
+- The copy never changes the exit code of the run.
 
 ## How it works
 

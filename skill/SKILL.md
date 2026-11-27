@@ -18,6 +18,7 @@ Output and the exit code come back as if the command ran here.
 Keep these on the Mac: git, file edits, file reads, short scripts, and anything that needs macOS or the screen.
 
 - A command made a file you need here: `fx-cloud pull <path>`
+- A TLA+ check printed a log path: read it here, fx-cloud copied it back. A log that is too large comes with the `fx-cloud pull` command to get it.
 - The sandbox changed files and `fx-cloud run` says so: `fx-cloud pull --patch --apply`
 - You are finished with the folder: `fx-cloud done`
 
