@@ -1293,7 +1293,7 @@ def cache_says_synced(st):
 
 def remember_synced(st):
     os.makedirs(os.path.dirname(cache_path(st)), exist_ok=True)
-    tmp = cache_path(st) + ".tmp"
+    tmp = cache_path(st) + ".%d.%s.tmp" % (os.getpid(), uuid.uuid4().hex[:8])
     with open(tmp, "w") as f:
         json.dump({"sha": st["sha"], "tree": st["tree"], "top": st["top"]}, f)
     os.replace(tmp, cache_path(st))
@@ -1350,65 +1350,117 @@ def run_plain(script, capture):
         return rc, out
 
 
+def copy_lock(st):
+    return file_lock(os.path.join(STATE_DIR, "copy-locks", "%s-%s.lock" % (SANDBOX, st["key"])))
+
+
+def copy_strategies(st):
+    copy_info(st)
+    return ["remotes", "merge-base", "full"] if st["origin"] else ["full"]
+
+
+def send_copy(st, force, strategies, capture):
+    """One sandbox call that makes the sandbox copy match the worktree. Returns (rc, results, out)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = None
+        while strategies and payload is None:
+            payload = copy_payload(st, strategies[0], tmp)
+            if payload is None:
+                strategies.pop(0)
+        if payload is None:
+            die("cannot send the commits to the sandbox")
+        bundle_arg, exclude_arg, cleanup, size = payload
+        say("copying %s to the sandbox (%s)" % (st["top"], human(size)))
+        apply = helper_script("apply", st["top"], st["sha"], st["tree"], st["cwip"], st["inc_arg"],
+                              st["origin"], bundle_arg, exclude_arg, "1" if force else "0")
+        return remote_stream(apply + cleanup, capture=capture)
+
+
+def copy_under_lock(st, force, strategies, capture):
+    """Copies the worktree while holding the copy lock. Returns (status, rc, out): "skipped" or
+    "copied" let the run go ahead, "retry" and "old_helper" ask for another try, and "failed" ends
+    the command with rc. Only copies take turns; a run never waits for another run's command."""
+    with copy_lock(st):
+        if not force and cache_says_synced(st):
+            return "skipped", 0, ""
+        rc, results, out = send_copy(st, force, strategies, capture)
+        last = results[-1] if results else {}
+        if is_old_helper(rc, last):
+            return "old_helper", rc, out
+        changed = next((r for r in results if "sandbox_changed" in r), None)
+        if changed:
+            forget_synced(st)
+            report_sandbox_changed(changed["sandbox_changed"])
+            return "failed", 1, out
+        err = next((r for r in results if r.get("error")), None)
+        if err and err["error"] == "prerequisite" and len(strategies) > 1:
+            strategies.pop(0)  # the sandbox lacks commits the bundle builds on; send more history
+            return "retry", rc, out
+        if err:
+            forget_synced(st)
+            say("sandbox: %s %s" % (err["error"], err.get("detail", "")))
+            return "failed", 1, out
+        if rc != 0:
+            forget_synced(st)
+            return "failed", rc, out
+        applied = next((r for r in results if r.get("ok")), None)
+        if applied and not applied.get("tree_match", True):
+            say("note: the sandbox copy differs from the Mac in ignored or special files")
+        remember_synced(st)
+        return "copied", rc, out
+
+
 def run_checked_and_ran(st, script, capture=False, force=False):
-    """Runs SCRIPT in the sandbox copy of the worktree. When the copy may differ from the Mac, the
-    same sandbox call first makes it match, so a changed worktree usually costs one call. Returns
-    (rc, out, ran); ran is False when the sandbox did not start SCRIPT."""
+    """Runs SCRIPT in the sandbox copy of the worktree. When the copy may differ from the Mac, a copy
+    call under the copy lock comes first, and the run itself takes no lock. Returns (rc, out, ran);
+    ran is False when the sandbox did not start SCRIPT."""
     if st is None:
         return run_plain(script, capture) + (True,)
     strategies = None
     copy = force or not cache_says_synced(st)
     helper_updated = False
+    announced = False
     for _ in range(6):
+        copied = False
+        if copy:
+            if strategies is None:
+                strategies = copy_strategies(st)
+            status, rc, out = copy_under_lock(st, force, strategies, capture)
+            if status == "old_helper":
+                if helper_updated:
+                    say("sandbox: old_helper")
+                    return 1, out, False
+                upload_helper()
+                helper_updated = True
+                continue
+            if status == "retry":
+                continue
+            if status == "failed":
+                return rc, out, False
+            copied = status == "copied"
+        if not announced:
+            say("running in sandbox %s for %s" % (SANDBOX, st["top"]))
+            announced = True
         pidfile = "/tmp/fxc-runs/%s.pid" % uuid.uuid4().hex
         run = helper_script("run", st["top"], st["cwd"], st["sha"], st["tree"], st.get("cwip", "-"),
                             st["inc_arg"], pidfile, script)
-        with tempfile.TemporaryDirectory() as tmp:
-            remote = run
-            if copy:
-                copy_info(st)
-                if strategies is None:
-                    strategies = ["remotes", "merge-base", "full"] if st["origin"] else ["full"]
-                payload = None
-                while strategies and payload is None:
-                    payload = copy_payload(st, strategies[0], tmp)
-                    if payload is None:
-                        strategies.pop(0)
-                if payload is None:
-                    die("cannot send the commits to the sandbox")
-                bundle_arg, exclude_arg, cleanup, size = payload
-                say("copying %s to the sandbox (%s)" % (st["top"], human(size)))
-                apply = helper_script("apply", st["top"], st["sha"], st["tree"], st["cwip"], st["inc_arg"],
-                                      st["origin"], bundle_arg, exclude_arg, "1" if force else "0")
-                remote = "(" + apply + " && " + run + ")" + cleanup
-            rc, results, out = remote_stream(remote, capture=capture, pidfile=pidfile)
+        rc, results, out = remote_stream(run, capture=capture, pidfile=pidfile)
         last = results[-1] if results else {}
         if not helper_updated and is_old_helper(rc, last):
             upload_helper()
             helper_updated = True
             continue
-        changed = next((r for r in results if "sandbox_changed" in r), None)
-        if changed:
-            forget_synced(st)
-            report_sandbox_changed(changed["sandbox_changed"])
-            return 1, out, False
         err = next((r for r in results if r.get("error")), None)
-        if err and err["error"] == "prerequisite" and strategies and len(strategies) > 1:
-            strategies.pop(0)  # the sandbox lacks commits the bundle builds on; send more history
-            continue
         if err:
             forget_synced(st)
             say("sandbox: %s %s" % (err["error"], err.get("detail", "")))
             return 1, out, False
         if rc == NEEDS_PUSH and last.get("needs_push"):
-            if copy:
+            if copied:
                 die("the sandbox copy still differs after copying; run with --force")
-            copy = True  # the remembered state was stale
+            forget_synced(st)  # the remembered state was stale
+            copy = True
             continue
-        applied = next((r for r in results if r.get("ok")), None)
-        if applied and not applied.get("tree_match", True):
-            say("note: the sandbox copy differs from the Mac in ignored or special files")
-        remember_synced(st)
         return rc, out, True
     die("the sandbox copy did not settle after several tries")
 
