@@ -39,6 +39,7 @@ BYTES_PER_MEGABYTE = 1024 * BYTES_PER_KILOBYTE
 MAX_LOG_FILE_BYTES = 20 * BYTES_PER_MEGABYTE  # must equal LOG_FILE_LIMIT_BYTES in remote/fxc-remote.py; a unit test checks it
 MAX_LOG_TOTAL_BYTES = 50 * BYTES_PER_MEGABYTE  # must equal LOG_TOTAL_LIMIT_BYTES in remote/fxc-remote.py; a unit test checks it
 STALE_DOWNLOAD_SECONDS = 600  # a run killed mid-copy leaves its logs-*.tgz behind
+COPY_TIMEOUT_SECONDS = 300  # the copy is at most 50 MB
 REASON_MAX_CHARACTERS = 200
 
 
@@ -172,6 +173,14 @@ def escape_char(ch):
     return "\\x%02x" % code if code < 256 else "\\u%04x" % code
 
 
+def char_bytes(ch):
+    # A file name that is not UTF-8 holds its bytes as surrogates U+DC80..U+DCFF; other surrogates have no byte form.
+    try:
+        return ch.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return ch.encode("utf-8", "surrogatepass")
+
+
 def shell_escape_char(ch):
     if ch == "\\":
         return "\\\\"
@@ -179,7 +188,7 @@ def shell_escape_char(ch):
         return "\\'"
     if ch.isprintable():
         return ch
-    return "".join("\\x%02x" % byte for byte in ch.encode("utf-8"))
+    return "".join("\\x%02x" % byte for byte in char_bytes(ch))
 
 
 def shell_quote_printable(text):
@@ -190,7 +199,9 @@ def shell_quote_printable(text):
 
 def human_size(byte_count):
     if byte_count >= BYTES_PER_MEGABYTE:
-        return "%.1f MB" % (byte_count / BYTES_PER_MEGABYTE)
+        # Rounds up, so a file over a limit never prints as the limit.
+        tenths = -(-byte_count * 10 // BYTES_PER_MEGABYTE)
+        return "%d.%d MB" % divmod(tenths, 10)
     if byte_count >= BYTES_PER_KILOBYTE:
         return "%d KB" % max(1, byte_count // BYTES_PER_KILOBYTE)
     return "%d bytes" % byte_count
@@ -199,8 +210,13 @@ def human_size(byte_count):
 def skipped_note(path_and_bytes, run_dir):
     relpath, byte_count = path_and_bytes
     full = run_dir + "/" + relpath
-    return "%s is too large to copy back (%s); get it with: fx-cloud pull %s <dest>" % (
-        printable(full), human_size(byte_count), shell_quote_printable(full))
+    if byte_count > MAX_LOG_FILE_BYTES:
+        reason = "is too large to copy back (%s; the limit is %d MB for one file)" % (
+            human_size(byte_count), MAX_LOG_FILE_BYTES // BYTES_PER_MEGABYTE)
+    else:
+        reason = "did not fit in the copy (%s; the limit is %d MB for all logs of one run)" % (
+            human_size(byte_count), MAX_LOG_TOTAL_BYTES // BYTES_PER_MEGABYTE)
+    return "%s %s; get it with: fx-cloud pull %s <dest>" % (printable(full), reason, shell_quote_printable(full))
 
 
 def refused_note(refused, run_dir):
@@ -234,7 +250,10 @@ def fetch_logs(core, run_dir, tgz):
     """Copies the run's tarball from the sandbox to TGZ. Returns (ok, reason); reason is "" when ok."""
     try:
         done = core.subprocess.run(core.vercel("copy", "%s:%s.tgz" % (core.SANDBOX, run_dir), tgz),
-                                   stdout=core.subprocess.DEVNULL, stderr=core.subprocess.PIPE, text=True)
+                                   stdout=core.subprocess.DEVNULL, stderr=core.subprocess.PIPE, text=True,
+                                   timeout=COPY_TIMEOUT_SECONDS)
+    except core.subprocess.TimeoutExpired:
+        return False, "the copy took longer than %d s" % COPY_TIMEOUT_SECONDS
     except OSError as e:
         return False, printable(str(e) or type(e).__name__)
     if done.returncode == 0:
@@ -305,7 +324,10 @@ def main(core, args):
     uid = os.getuid()
     run_dir = run_dir_path(uid, uuid.uuid4().hex[:RUN_ID_CHARS])
     pack_command = core.helper_script("packlogs", run_dir, run_dir + ".tgz")
-    rc, _ = core.run_here(remote_script(shlex.join([tool] + rest), run_dir, pack_command), {})
+    rc, _, ran = core.run_here_and_ran(remote_script(shlex.join([tool] + rest), run_dir, pack_command))
+    if not ran:
+        # The sandbox did not start the check and already said why, so no logs exist.
+        return rc
     # The run's exit code must stay the check's own, so a broken copy-back only prints a note.
     try:
         bring_logs_back(core, run_dir, uid)

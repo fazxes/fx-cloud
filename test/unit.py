@@ -645,14 +645,44 @@ class TlaLogTests(unittest.TestCase):
 
     def test_skipped_note_escapes_control_characters_and_quotes_the_path(self):
         note = tla.skipped_note(("a\x1b[31mb.log", 31457280), "/tmp/fxc-tla-501/ab12cd34")
-        self.assertEqual(note, "/tmp/fxc-tla-501/ab12cd34/a\\x1b[31mb.log is too large to copy back (30.0 MB); "
+        self.assertEqual(note, "/tmp/fxc-tla-501/ab12cd34/a\\x1b[31mb.log is too large to copy back "
+                               "(30.0 MB; the limit is 20 MB for one file); "
                                "get it with: fx-cloud pull $'/tmp/fxc-tla-501/ab12cd34/a\\x1b[31mb.log' <dest>")
         self.assertNotIn("\x1b", note)
 
     def test_skipped_note_shows_the_real_size_of_a_small_file(self):
-        self.assertIn("(6 KB)", tla.skipped_note(("b.log", 6 * 1024), "/r"))
-        self.assertIn("(300 bytes)", tla.skipped_note(("c.log", 300), "/r"))
-        self.assertIn("(1023 KB)", tla.skipped_note(("d.log", 1048575), "/r"))
+        small = "did not fit in the copy (%s; the limit is 50 MB for all logs of one run)"
+        self.assertIn(small % "6 KB", tla.skipped_note(("b.log", 6 * 1024), "/r"))
+        self.assertIn(small % "300 bytes", tla.skipped_note(("c.log", 300), "/r"))
+        self.assertIn(small % "1023 KB", tla.skipped_note(("d.log", 1048575), "/r"))
+
+    def test_skipped_note_names_the_limit_it_hit(self):
+        too_big = tla.skipped_note(("big.log", 20 * 1024 * 1024 + 1), "/r")
+        self.assertIn("is too large to copy back (20.1 MB; the limit is 20 MB for one file)", too_big)
+        small = tla.skipped_note(("small.log", 3072), "/r")
+        self.assertIn("did not fit in the copy (3 KB; the limit is 50 MB for all logs of one run)", small)
+
+    def test_human_size_rounds_megabytes_up(self):
+        self.assertEqual(tla.human_size(20 * 1024 * 1024), "20.0 MB")
+        self.assertEqual(tla.human_size(20 * 1024 * 1024 + 1), "20.1 MB")
+        self.assertEqual(tla.human_size(50 * 1024 * 1024 + 1), "50.1 MB")
+        self.assertEqual(tla.human_size(1048575), "1023 KB")
+
+    def test_skipped_note_handles_a_name_that_is_not_utf8(self):
+        name = json.loads(json.dumps(b"bad\xff.log".decode("utf-8", "surrogateescape")))
+        note = tla.skipped_note((name, 2048), "/tmp/run")
+        hint = "$'/tmp/run/bad\\xff.log'"
+        self.assertIn("fx-cloud pull " + hint + " <dest>", note)
+        for shell in ("/bin/bash", "/bin/zsh"):
+            with self.subTest(shell=shell):
+                if not os.path.exists(shell):
+                    self.skipTest(shell + " is not installed")
+                result = subprocess.run([shell, "-f", "-c", "printf %s " + hint], capture_output=True, check=True)
+                self.assertEqual(result.stdout, b"/tmp/run/bad\xff.log")
+
+    def test_skipped_note_does_not_raise_on_any_surrogate(self):
+        note = tla.skipped_note(("x\ud800y.log", 2048), "/r")
+        self.assertIn("fx-cloud pull $'/r/x\\xed\\xa0\\x80y.log' <dest>", note)
 
     def test_log_notes_mentions_refused_entries(self):
         self.assertEqual(tla.log_notes(0, [], 2, "/r"),
@@ -702,9 +732,9 @@ class TlaLogTests(unittest.TestCase):
         os.chdir(repo)
         scripts = []
 
-        def run_here(script, flags, capture=False):
+        def run_here_and_ran(script):
             scripts.append(script)
-            return 3, b""
+            return 3, b"", True
 
         core = types.SimpleNamespace(
             take_flags=fxc.take_flags,
@@ -714,7 +744,7 @@ class TlaLogTests(unittest.TestCase):
             need_config=lambda tool: None,
             say=lambda msg: None,
             helper_script=lambda op, *a: "PACK " + op + " " + " ".join(a),
-            run_here=run_here,
+            run_here_and_ran=run_here_and_ran,
         )
         with mock.patch.object(tla, "bring_logs_back") as bring_back:
             code = tla.main(core, ["--tool", "sh", "--real", "/bin/sh", "--", "tests/tla/demo/check.sh"])
@@ -744,12 +774,61 @@ class TlaLogTests(unittest.TestCase):
             need_config=lambda tool: None,
             say=said.append,
             helper_script=lambda op, *a: "PACK " + op + " " + " ".join(a),
-            run_here=lambda script, flags, capture=False: (3, b""),
+            run_here_and_ran=lambda script: (3, b"", True),
         )
         with mock.patch.object(tla, "bring_logs_back", side_effect=zlib.error("bad data")):
             code = tla.main(core, ["--tool", "sh", "--real", "/bin/sh", "--", "tests/tla/demo/check.sh"])
         self.assertEqual(code, 3)
         self.assertEqual(said[-1], "could not copy the TLC logs back: bad data")
+
+    def test_main_skips_the_copy_back_when_the_check_never_started(self):
+        repo = self.path("proj")
+        self.write_text(os.path.join(repo, "tests", "tla", "demo", "check.sh"), "exit 0\n")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(repo)
+        core = types.SimpleNamespace(
+            take_flags=fxc.take_flags,
+            die=fxc.die,
+            subprocess=subprocess,
+            project_allows_remote=lambda path: True,
+            need_config=lambda tool: None,
+            say=lambda msg: None,
+            helper_script=lambda op, *a: "PACK " + op + " " + " ".join(a),
+            run_here=lambda script, flags, capture=False: (1, b""),
+            run_here_and_ran=lambda script: (1, b"", False),
+        )
+        with mock.patch.object(tla, "bring_logs_back") as bring_back:
+            code = tla.main(core, ["--tool", "sh", "--real", "/bin/sh", "--", "tests/tla/demo/check.sh"])
+        self.assertEqual(code, 1)
+        bring_back.assert_not_called()
+
+    def checked_state(self):
+        return {"top": self.path("proj"), "cwd": self.path("proj"), "sha": "a" * 40, "tree": "b" * 40,
+                "cwip": "-", "inc_arg": "-", "origin": ""}
+
+    def test_run_checked_and_ran_says_no_when_the_sandbox_copy_changed(self):
+        with mock.patch.object(fxc, "cache_says_synced", return_value=True), \
+                mock.patch.object(fxc, "remote_stream", return_value=(1, [{"sandbox_changed": ["M a.txt"]}], b"")), \
+                mock.patch.object(fxc, "forget_synced"), mock.patch.object(fxc, "report_sandbox_changed"):
+            result = fxc.run_checked_and_ran(self.checked_state(), "true")
+        self.assertEqual(result, (1, b"", False))
+
+    def test_run_checked_and_ran_says_no_when_the_helper_reports_an_error(self):
+        with mock.patch.object(fxc, "cache_says_synced", return_value=True), \
+                mock.patch.object(fxc, "remote_stream", return_value=(1, [{"error": "git", "detail": "x"}], b"")), \
+                mock.patch.object(fxc, "forget_synced"), mock.patch.object(fxc, "say"):
+            result = fxc.run_checked_and_ran(self.checked_state(), "true")
+        self.assertEqual(result, (1, b"", False))
+
+    def test_run_checked_and_ran_says_yes_after_a_run(self):
+        with mock.patch.object(fxc, "cache_says_synced", return_value=True), \
+                mock.patch.object(fxc, "remote_stream", return_value=(3, [{"ok": True}], b"out")), \
+                mock.patch.object(fxc, "remember_synced"):
+            result = fxc.run_checked_and_ran(self.checked_state(), "true")
+            plain = fxc.run_checked(self.checked_state(), "true")
+        self.assertEqual(result, (3, b"out", True))
+        self.assertEqual(plain, (3, b"out"))
 
     def copy_download(self, source, argv):
         with open(source, "rb") as f, open(argv[-1], "wb") as out:
@@ -766,7 +845,8 @@ class TlaLogTests(unittest.TestCase):
             SANDBOX="fxa-test",
             say=said.append,
             vercel=lambda sub, *args: [sub] + list(args),
-            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE,
+                                             TimeoutExpired=subprocess.TimeoutExpired),
         )
         tla.bring_logs_back(core, run_dir, os.getuid())
         return said
@@ -786,8 +866,8 @@ class TlaLogTests(unittest.TestCase):
         self.assertEqual(call.call_args.args[0][1], "fxa-test:" + run_dir + ".tgz")
         self.assertEqual(said, [
             "copied 1 TLC log file to " + run_dir,
-            run_dir + "/fx-tla-demo.X/Big.log is too large to copy back (30.0 MB); get it with: fx-cloud pull "
-            + shlex.quote(run_dir + "/fx-tla-demo.X/Big.log") + " <dest>",
+            run_dir + "/fx-tla-demo.X/Big.log is too large to copy back (30.0 MB; the limit is 20 MB for one file); "
+            + "get it with: fx-cloud pull " + shlex.quote(run_dir + "/fx-tla-demo.X/Big.log") + " <dest>",
         ])
         self.assertEqual(self.leftover_downloads(), [])
 
@@ -812,7 +892,8 @@ class TlaLogTests(unittest.TestCase):
         core = types.SimpleNamespace(
             SANDBOX="fxa-test",
             vercel=lambda sub, *args: [sub] + list(args),
-            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE,
+                                             TimeoutExpired=subprocess.TimeoutExpired),
         )
         self.assertEqual(tla.fetch_logs(core, "/r/x", "/tmp/t.tgz"), (False, "No such file or directory: 'vercel'"))
 
@@ -821,9 +902,31 @@ class TlaLogTests(unittest.TestCase):
         core = types.SimpleNamespace(
             SANDBOX="fxa-test",
             vercel=lambda sub, *args: [sub] + list(args),
-            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE,
+                                             TimeoutExpired=subprocess.TimeoutExpired),
         )
         self.assertEqual(tla.fetch_logs(core, "/r/x", "/tmp/t.tgz"), (False, "OSError"))
+
+    def test_fetch_logs_reports_a_copy_that_runs_too_long(self):
+        run = mock.Mock(side_effect=subprocess.TimeoutExpired(["vercel", "copy"], 300))
+        core = types.SimpleNamespace(
+            SANDBOX="fxa-test",
+            vercel=lambda sub, *args: [sub] + list(args),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE,
+                                             TimeoutExpired=subprocess.TimeoutExpired),
+        )
+        self.assertEqual(tla.fetch_logs(core, "/r/x", "/tmp/t.tgz"), (False, "the copy took longer than 300 s"))
+
+    def test_fetch_logs_gives_the_copy_a_timeout(self):
+        run = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stderr=""))
+        core = types.SimpleNamespace(
+            SANDBOX="fxa-test",
+            vercel=lambda sub, *args: [sub] + list(args),
+            subprocess=types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE,
+                                             TimeoutExpired=subprocess.TimeoutExpired),
+        )
+        self.assertEqual(tla.fetch_logs(core, "/r/x", "/tmp/t.tgz"), (True, ""))
+        self.assertEqual(run.call_args.kwargs["timeout"], 300)
 
     def test_stale_downloads_picks_old_downloads_only(self):
         entries = [("logs-a.tgz", 0), ("logs-b.tgz", 9999), ("other.tgz", 0), ("logs-c.txt", 0)]
